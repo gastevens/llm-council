@@ -11,11 +11,38 @@ sandbox), so council members answer from the model only and never touch files.
 
 import asyncio
 import json
+import logging
 import os
 import shutil
+import signal
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+log = logging.getLogger("council.providers")
+
+# CLI subprocesses currently running. Each one is started in its own session
+# (so it never grabs the caller's terminal), which also means a terminal hangup
+# does not reach it; front ends call kill_active_processes() on shutdown.
+_ACTIVE: Set[asyncio.subprocess.Process] = set()
+
+
+def kill_active_processes(sig: int = signal.SIGTERM) -> int:
+    """Signal every running CLI subprocess (and its process group). Thread-safe enough
+    to call from a signal handler or another thread; returns how many were signalled."""
+    n = 0
+    for proc in list(_ACTIVE):
+        if proc.returncode is not None:
+            continue
+        try:
+            os.killpg(proc.pid, sig)  # start_new_session=True -> pgid == pid
+        except (ProcessLookupError, PermissionError):
+            try:
+                os.kill(proc.pid, sig)
+            except ProcessLookupError:
+                continue
+        n += 1
+    return n
 
 
 @dataclass(frozen=True)
@@ -68,19 +95,35 @@ async def _run(cmd: List[str], stdin_text: Optional[str], cwd: str, timeout: flo
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    _ACTIVE.add(proc)
     try:
         out, err = await asyncio.wait_for(
             proc.communicate(stdin_text.encode() if stdin_text is not None else None),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        _killpg(proc)
         await proc.wait()
         raise TimeoutError(f"{os.path.basename(cmd[0])} timed out after {timeout:.0f}s")
+    except asyncio.CancelledError:
+        _killpg(proc)
+        raise
+    finally:
+        _ACTIVE.discard(proc)
     if proc.returncode != 0:
         tail = err.decode(errors="replace").strip()[-500:]
         raise RuntimeError(f"{os.path.basename(cmd[0])} exited {proc.returncode}: {tail}")
     return out.decode(errors="replace")
+
+
+def _killpg(proc: asyncio.subprocess.Process) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 async def _query_codex(member: Member, prompt: str, workdir: str, timeout: float) -> str:
@@ -178,4 +221,5 @@ async def query_member(
         return {"content": content}
     except Exception as e:  # graceful degradation, like the original client
         print(f"Error querying {member.name} via {member.provider}: {e}")
+        log.warning("%s (%s) failed: %s", member.name, member.provider, e)
         return None

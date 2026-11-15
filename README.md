@@ -106,6 +106,27 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llm-council.warroom.
 
 Tests for the Slack formatting and wiring: `uv run python -m unittest discover -s tests`.
 
+## War Room in the terminal (TUI + Mac app)
+
+```bash
+uv run python -m backend.tui           # ask at the bottom; stages render live
+uv run python -m backend.tui --fake    # canned answers, no CLI calls
+uv run python -m backend.tui --ask "Should we self-host email?"
+```
+
+Stage 1 shows one tab per member, Stage 2 the peer-ranking table with
+collapsible critiques, Stage 3 the chairman's verdict. Follow-ups in the same
+session include the earlier questions and verdicts. Keys: `ctrl+n` new session,
+`ctrl+s` save a Markdown transcript to `~/Documents/War Room/`, `ctrl+c` (or `q`
+outside the input box) to quit. Sessions are also stored in `data/conversations/`.
+
+`macos/build-app.sh` (re)builds `~/Applications/War Room.app`. It opens the TUI
+in its own Ghostty window (War Room icon in the Dock) and quits completely when
+that window closes: the TUI kills any running codex/claude/grok calls on hangup,
+and the window's wrapper script sweeps anything left. Re-run the build script
+after moving the repo. Extra arguments pass through:
+`open -a "War Room" --args --fake`.
+
 ## Vibe Code Alert
 
 This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.
