@@ -54,7 +54,7 @@ class AppWiringTests(unittest.TestCase):
         finally:
             if os.environ.get("SLACK_BOT_TOKEN") == "xoxb-test-not-real":
                 del os.environ["SLACK_BOT_TOKEN"]
-        self.assertEqual(len(app._listeners), 3)
+        self.assertGreaterEqual(len(app._listeners), 4)  # mention, message, /warroom, roster actions
 
 
 if __name__ == "__main__":

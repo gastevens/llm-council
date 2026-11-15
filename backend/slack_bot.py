@@ -6,7 +6,8 @@
 
 Triggers:
   * @War Room <question> in any channel the bot is in (intended: #war-room)
-  * /warroom <question>    (/warroom roster shows the current council)
+  * /warroom <question>    (/warroom help lists roster commands: roster, add,
+    remove, enable, disable, chair, title, models, test, reset)
   * any plain reply inside a War Room thread = follow-up question (earlier
     questions and verdicts from the thread are included as context)
 
@@ -17,6 +18,8 @@ Tokens come from the environment or the repo's .env file and are never printed:
 Optional:
   WARROOM_MAX_CONCURRENT  councils allowed to run at once (default 1; others queue)
   WARROOM_CRITIQUE_CHARS  max chars of each Stage 2 critique to post (default 1200, 0 = full)
+  WARROOM_ADMINS          comma-separated Slack user IDs allowed to edit the roster
+                          (unset = anyone in the workspace)
 """
 
 import argparse
@@ -35,7 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")  # before config import so launchd runs see .env
 
 from .config import TIMEOUT  # noqa: E402
-from .council_config import Roster, config_path, current_roster, roster_lines  # noqa: E402
+from .council_config import Roster, config_path, current_roster, ping_member  # noqa: E402
+from . import slack_roster  # noqa: E402
 from .council import (  # noqa: E402
     calculate_aggregate_rankings,
     stage2_collect_rankings,
@@ -168,11 +172,25 @@ def thread_history(client, channel: str, thread_ts: str, bot_user_id: str,
 
 
 def roster_text(roster: Roster) -> str:
-    """Ephemeral reply for `/warroom roster`."""
-    head = f":classical_building: *War Room council* — chair: *{roster.chairman}*"
-    tail = ("_Edit it in the War Room TUI (ctrl+e) or with "
-            "`uv run python -m backend.council_config` on the Mac mini._")
-    return "\n".join([head, *roster_lines(roster, markdown=True), tail])
+    """Plain-text roster (kept for callers/tests); see slack_roster for blocks."""
+    return slack_roster.roster_text(roster)
+
+
+def run_ping(member, user_id: str, respond) -> None:
+    """Ping a member (blocking, in a worker thread) and replace the ephemeral message."""
+    try:
+        ok, text = asyncio.run(ping_member(member))
+    except Exception as e:
+        ok, text = False, f"{type(e).__name__}: {e}"
+    reply = slack_roster.reply_from_ping(member, ok, text,
+                                         can_edit=slack_roster.can_edit_roster(user_id))
+    respond(text=reply.text, blocks=reply.blocks, replace_original=True, response_type="ephemeral")
+
+
+def send_reply(reply, user_id: str, respond, replace: bool) -> None:
+    respond(text=reply.text, blocks=reply.blocks, replace_original=replace, response_type="ephemeral")
+    if reply.ping is not None:
+        threading.Thread(target=run_ping, args=(reply.ping, user_id, respond), daemon=True).start()
 
 
 def build_app(**app_kwargs):
@@ -236,13 +254,12 @@ def build_app(**app_kwargs):
     @app.command("/warroom")
     def on_command(ack, command, client, respond):
         ack()
-        question = (command.get("text") or "").strip()
-        if not question:
-            respond("Usage: `/warroom <question>` (or `/warroom roster` to see the council)")
+        parsed = slack_roster.parse_slash_text(command.get("text") or "")
+        if parsed.kind != "question":
+            reply = slack_roster.dispatch_slash(parsed, user_id=command.get("user_id", ""))
+            send_reply(reply, command.get("user_id", ""), respond, replace=False)
             return
-        if question.lower() == "roster":
-            respond(roster_text(current_roster()))
-            return
+        question = parsed.question
         try:
             root = client.chat_postMessage(
                 channel=command["channel_id"],
@@ -256,6 +273,15 @@ def build_app(**app_kwargs):
                 respond(f"Couldn't start the council: `{err or type(e).__name__}`")
             return
         start(client, command["channel_id"], root["ts"], question)
+
+    import re as _re
+
+    @app.action(_re.compile(r"^warroom_(toggle|chair|remove|test)__\d+$|^warroom_reset$"))
+    def on_roster_action(ack, body, action, respond):
+        ack()
+        user_id = (body.get("user") or {}).get("id", "")
+        reply = slack_roster.handle_action(action.get("action_id", ""), action.get("value", ""), user_id)
+        send_reply(reply, user_id, respond, replace=True)
 
     return app
 

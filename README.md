@@ -64,11 +64,20 @@ so there is no public URL or server to host) and uses the same subscription CLIs
   verdicts from the thread are passed to the council as context.
 - If a member fails or times out, the thread says so and the council carries on.
   One council runs at a time; extra requests queue (`WARROOM_MAX_CONCURRENT`).
+- `/warroom roster` shows the council with buttons to enable/disable, set the chair,
+  test, or remove a member. Subcommands (all ephemeral):
+  `/warroom add NAME provider [model] [color]`, `remove NAME`, `enable|disable NAME`,
+  `chair NAME`, `title NAME`, `models [provider]`, `test NAME`, `reset`, `help`.
+  Edits write `~/.config/war-room/council.json` and apply to the next council in
+  both Slack and the TUI. Set `WARROOM_ADMINS` to a comma-separated list of Slack
+  user IDs to limit who can edit (unset = anyone in the workspace).
 
 ### 1. Create the Slack app (one time)
 
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**.
 2. Pick your workspace, choose YAML, paste [`slack/manifest.yaml`](slack/manifest.yaml), then **Create**.
+   If the app already exists, open it → **App Manifest**, paste the updated YAML, and **Save**.
+   (Roster buttons need Interactivity enabled; Socket Mode still needs no Request URL. No new scopes, so you don't have to reinstall.)
 3. **Install App** (left sidebar) → **Install to Workspace** → **Allow**.
    Copy the **Bot User OAuth Token** (`xoxb-…`).
 4. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**.
@@ -134,7 +143,7 @@ every question. Several members can share a CLI with different models.
 - CLI: `uv run python -m backend.council_config list | add NAME -p claude -m opus -c pink |
   remove NAME | enable NAME | disable NAME | chair NAME | title NAME | up/down NAME |
   test NAME | models [PROVIDER] | reset`
-- Slack: `/warroom roster` shows the current council (read-only).
+- Slack: `/warroom roster` shows the council with edit buttons; `/warroom help` lists the text commands. Same file as the TUI.
 
 Model ids: codex takes `-m` (the list comes from `~/.codex/models_cache.json`),
 claude takes `--model` aliases `opus`/`sonnet`/`haiku` or a full `claude-…`
