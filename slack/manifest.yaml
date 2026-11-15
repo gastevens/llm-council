@@ -1,0 +1,39 @@
+# Slack app manifest for the War Room bot.
+# api.slack.com/apps -> Create New App -> From a manifest -> pick workspace -> paste this.
+display_information:
+  name: War Room
+  description: ChatGPT, Claude and Grok deliberate on your question; a chairman delivers the verdict.
+  long_description: >-
+    Mention @War Room (or use /warroom) with a question. Each council member answers
+    independently, they review and rank each other's answers anonymously, and the chairman
+    writes a final verdict, all posted in the thread. Reply in the thread to ask a follow-up.
+    Runs locally on a Mac via Socket Mode using the owner's ChatGPT, Claude and Grok subscriptions.
+  background_color: "#1f2a44"
+features:
+  bot_user:
+    display_name: War Room
+    always_online: true
+  slash_commands:
+    - command: /warroom
+      description: Ask the council (ChatGPT, Claude, Grok) a question
+      usage_hint: "<question>"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read   # @War Room triggers
+      - chat:write          # post answers in threads
+      - commands            # /warroom
+      - channels:history    # read thread replies (follow-ups) in public channels
+      - groups:history      # same, in private channels
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels    # plain replies in War Room threads = follow-ups
+      - message.groups
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

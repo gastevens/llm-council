@@ -21,6 +21,13 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - `query_member()` returns `{'content': ...}` or None on failure
 - Members/chairman configured in `config.py` via `COUNCIL_MEMBERS`, `COUNCIL_CHAIRMAN`, `COUNCIL_TITLE_MEMBER`, `COUNCIL_TIMEOUT`
 
+**`slack_bot.py` / `slack_format.py`** (war-room branch)
+- Slack Bolt (Socket Mode) front end: `uv run python -m backend.slack_bot` or `./slack.sh`; `--dry-run "Q"` prints posts, `--fake` uses canned answers
+- `deliberate(question, post)` runs the stages itself (stage 1 via `query_member` + `as_completed` so each answer posts as it lands, then `stage2_collect_rankings`, `stage3_synthesize_final`)
+- Triggers: `app_mention`, `/warroom`, and plain thread replies in threads containing the bot's "Convening the council" message (follow-ups get thread context via `build_followup_question`)
+- `slack_format.py` is SDK-free: Markdown→mrkdwn, 3500-char splitting that keeps code fences balanced; tests in `tests/`
+- Manifest: `slack/manifest.yaml`; LaunchAgent template: `slack/com.llm-council.warroom.plist.template`
+
 **`openrouter.py`**
 - `query_model()`: Single async model query
 - `query_models_parallel()`: Parallel queries using `asyncio.gather()`

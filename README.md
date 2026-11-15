@@ -49,6 +49,63 @@ COUNCIL_TIMEOUT=300                      # seconds per call
 
 A full three-stage round with three members takes about a minute.
 
+## War Room in Slack
+
+Ask the council from Slack. The bot runs locally on the Mac (Slack
+[Bolt for Python](https://docs.slack.dev/tools/bolt-python/) in Socket Mode,
+so there is no public URL or server to host) and uses the same subscription CLIs.
+
+- `@War Room <question>` in any channel the bot is in (e.g. `#war-room`), or `/warroom <question>`.
+- The bot replies in a thread: "Convening the council…", then each member's answer
+  as it finishes (one message per member), then the peer-review summary (average
+  rank plus a shortened critique from each reviewer), then the chairman's verdict.
+  Long answers are converted to Slack formatting and split into several messages.
+- Reply in that thread (no mention needed) to ask a follow-up; earlier questions and
+  verdicts from the thread are passed to the council as context.
+- If a member fails or times out, the thread says so and the council carries on.
+  One council runs at a time; extra requests queue (`WARROOM_MAX_CONCURRENT`).
+
+### 1. Create the Slack app (one time)
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**.
+2. Pick your workspace, choose YAML, paste [`slack/manifest.yaml`](slack/manifest.yaml), then **Create**.
+3. **Install App** (left sidebar) → **Install to Workspace** → **Allow**.
+   Copy the **Bot User OAuth Token** (`xoxb-…`).
+4. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**.
+   Name it e.g. `socket`, add the scope `connections:write`, **Generate**, and copy the token (`xapp-…`).
+
+### 2. Add the tokens
+
+```bash
+cp .env.example .env      # .env is git-ignored
+# edit .env:
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+```
+
+### 3. Start it
+
+```bash
+./slack.sh                                  # stays connected; Ctrl+C to stop
+./slack.sh --dry-run "Should we self-host email?"   # no Slack: print the posts it would make
+./slack.sh --fake --dry-run "test"          # canned answers, no CLI calls (formatting check)
+```
+
+Then in Slack create `#war-room` (or use any channel) and invite the bot:
+`/invite @War Room`. Mention it with a question to start.
+
+To run it at login, install the LaunchAgent template (logs go to
+`~/Library/Logs/llm-council-warroom.log`):
+
+```bash
+sed -e "s#__REPO__#$PWD#g" -e "s#__HOME__#$HOME#g" \
+  slack/com.llm-council.warroom.plist.template > ~/Library/LaunchAgents/com.llm-council.warroom.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llm-council.warroom.plist
+# stop: launchctl bootout gui/$(id -u)/com.llm-council.warroom
+```
+
+Tests for the Slack formatting and wiring: `uv run python -m unittest discover -s tests`.
+
 ## Vibe Code Alert
 
 This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.

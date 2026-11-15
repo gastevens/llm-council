@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template: runs the War Room Slack bot at login and restarts it if it exits.
+  NOT installed automatically. To install (replace __REPO__ / __HOME__ first, see README):
+
+    sed -e "s#__REPO__#$HOME/code/forks/llm-council#g" -e "s#__HOME__#$HOME#g" \
+      slack/com.llm-council.warroom.plist.template > ~/Library/LaunchAgents/com.llm-council.warroom.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llm-council.warroom.plist
+
+  Stop / uninstall:
+    launchctl bootout gui/$(id -u)/com.llm-council.warroom
+    rm ~/Library/LaunchAgents/com.llm-council.warroom.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.llm-council.warroom</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO__/slack.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd has a minimal PATH; the council CLIs (codex, claude, grok) and uv live here -->
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/llm-council-warroom.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/llm-council-warroom.log</string>
+</dict>
+</plist>
