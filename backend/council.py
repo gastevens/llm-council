@@ -1,8 +1,21 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from typing import List, Dict, Any, Optional, Tuple
+import asyncio
+
+from .config import COUNCIL_MEMBERS, CHAIRMAN, TITLE_MEMBER, TIMEOUT
+from .providers import Member, query_member
+
+
+async def query_members_parallel(
+    members: List[Member],
+    messages: List[Dict[str, str]],
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """Query all council members in parallel; maps display name -> response."""
+    responses = await asyncio.gather(
+        *[query_member(m, messages, timeout=TIMEOUT) for m in members]
+    )
+    return {m.name: r for m, r in zip(members, responses)}
 
 
 async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
@@ -18,7 +31,7 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     messages = [{"role": "user", "content": user_query}]
 
     # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await query_members_parallel(COUNCIL_MEMBERS, messages)
 
     # Format results
     stage1_results = []
@@ -95,7 +108,7 @@ Now provide your evaluation and ranking:"""
     messages = [{"role": "user", "content": ranking_prompt}]
 
     # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await query_members_parallel(COUNCIL_MEMBERS, messages)
 
     # Format results
     stage2_results = []
@@ -159,17 +172,17 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     messages = [{"role": "user", "content": chairman_prompt}]
 
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    response = await query_member(CHAIRMAN, messages, timeout=TIMEOUT)
 
     if response is None:
         # Fallback if chairman fails
         return {
-            "model": CHAIRMAN_MODEL,
+            "model": CHAIRMAN.name,
             "response": "Error: Unable to generate final synthesis."
         }
 
     return {
-        "model": CHAIRMAN_MODEL,
+        "model": CHAIRMAN.name,
         "response": response.get('content', '')
     }
 
@@ -274,12 +287,13 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    # Use a fast member for title generation (configurable via COUNCIL_TITLE_MEMBER)
+    response = await query_member(TITLE_MEMBER, messages, timeout=90.0)
 
     if response is None:
-        # Fallback to a generic title
-        return "New Conversation"
+        # Fallback: first few words of the question
+        words = user_query.split()
+        return " ".join(words[:6]) or "New Conversation"
 
     title = response.get('content', 'New Conversation').strip()
 
