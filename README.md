@@ -120,6 +120,26 @@ session include the earlier questions and verdicts. Keys: `ctrl+n` new session,
 `ctrl+s` save a Markdown transcript to `~/Documents/War Room/`, `ctrl+c` (or `q`
 outside the input box) to quit. Sessions are also stored in `data/conversations/`.
 
+### Choosing the council
+
+The roster (members, chair, title writer) lives in `~/.config/war-room/council.json`
+(override with `WARROOM_COUNCIL_CONFIG`); without it the `COUNCIL_*` env defaults
+apply. The TUI, Slack bot, `ask.py` and the web backend read it at the start of
+every question. Several members can share a CLI with different models.
+
+- TUI: `ctrl+e` opens Council settings: `space` on/off, `a` add (name, provider,
+  model, color), `del` remove, `[` / `]` reorder, `c` or the radio list to pick
+  the chair (any member, on or off), `t` sends a tiny prompt to check the CLI,
+  `ctrl+s` save, `esc` cancel. At least 2 members must be on.
+- CLI: `uv run python -m backend.council_config list | add NAME -p claude -m opus -c pink |
+  remove NAME | enable NAME | disable NAME | chair NAME | title NAME | up/down NAME |
+  test NAME | models [PROVIDER] | reset`
+- Slack: `/warroom roster` shows the current council (read-only).
+
+Model ids: codex takes `-m` (the list comes from `~/.codex/models_cache.json`),
+claude takes `--model` aliases `opus`/`sonnet`/`haiku` or a full `claude-…`
+name, grok takes `-m` (`grok models` lists them), openrouter needs a model id.
+
 `macos/build-app.sh` (re)builds `~/Applications/War Room.app`. It opens the TUI
 in its own Ghostty window (War Room icon in the Dock) and quits completely when
 that window closes: the TUI kills any running codex/claude/grok calls on hangup,

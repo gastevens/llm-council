@@ -6,10 +6,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# Hermetic roster: env defaults (ChatGPT, Claude, Grok; chair Claude) unless a test writes one.
+_ROSTER_DIR = tempfile.mkdtemp(prefix="warroom-test-")
+os.environ["WARROOM_COUNCIL_CONFIG"] = str(Path(_ROSTER_DIR) / "council.json")
+
 from textual.widgets import Collapsible, DataTable, Input, Markdown
 
 from backend import tui
-from backend.config import CHAIRMAN, COUNCIL_MEMBERS
+from backend.council_config import current_roster
+
+ROSTER = current_roster()
+COUNCIL_MEMBERS = ROSTER.active_members()
+CHAIR = ROSTER.chairman
 
 
 class Recorder(tui.Events):
@@ -42,7 +50,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(r["stage2"])
         self.assertIn("Use a hosted provider", r["stage3"]["response"])
         self.assertIn(("done", 1, "Grok", False, r["errors"]["Grok"]), ev.calls)
-        self.assertIn(("start", 3, CHAIRMAN.name), ev.calls)
+        self.assertIn(("start", 3, CHAIR), ev.calls)
         self.assertLess(ev.calls.index(("stage2",)), ev.calls.index(("stage3",)))
 
     def test_everyone_fails(self):

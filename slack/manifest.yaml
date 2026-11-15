@@ -16,7 +16,7 @@ features:
   slash_commands:
     - command: /warroom
       description: Ask the council (ChatGPT, Claude, Grok) a question
-      usage_hint: "<question>"
+      usage_hint: "<question>  or  roster"
       should_escape: false
 oauth_config:
   scopes:

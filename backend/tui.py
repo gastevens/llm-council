@@ -9,7 +9,8 @@ Stage 1 one tab per member, Stage 2 peer rankings + collapsible critiques,
 Stage 3 the chairman's verdict. Follow-up questions in the same session carry
 the earlier questions and verdicts as context.
 
-Keys: ctrl+n new session · ctrl+s save transcript (~/Documents/War Room/)
+Keys: ctrl+e council settings (add/remove members, pick the chair)
+      ctrl+n new session · ctrl+s save transcript (~/Documents/War Room/)
       q (outside the input) / ctrl+c / ctrl+q quit · esc leaves the input box
 
 Closing the terminal window (SIGHUP) or SIGTERM kills any running CLI
@@ -45,23 +46,17 @@ from textual.widgets import (  # noqa: E402
 )
 
 from . import council  # noqa: E402
-from .config import CHAIRMAN, COUNCIL_MEMBERS, TIMEOUT  # noqa: E402
+from .config import TIMEOUT  # noqa: E402
+from .council_config import Roster, RosterError, current_roster, load_roster  # noqa: E402
 from .providers import Member, kill_active_processes, query_member  # noqa: E402
 from .slack_format import build_followup_question, deanonymize  # noqa: E402
+from .tui_council import CouncilScreen  # noqa: E402
 
 TEAL, ORANGE, BLUE, PURPLE = "#20B8A4", "#F86522", "#1788F8", "#8F61F6"
 BG, FG, DIM = "#1F1F1F", "#FFFFFF", "#8C8C8C"
-MEMBER_COLORS = {"ChatGPT": TEAL, "Claude": ORANGE, "Grok": BLUE}
-FALLBACK_COLORS = [TEAL, ORANGE, BLUE, "#E8E6E0"]
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 Query = Callable[..., Awaitable[Optional[Dict[str, Any]]]]
-
-
-def color_for(name: str) -> str:
-    if name in MEMBER_COLORS:
-        return MEMBER_COLORS[name]
-    return FALLBACK_COLORS[sum(map(ord, name)) % len(FALLBACK_COLORS)]
 
 
 def slug(name: str) -> str:
@@ -111,8 +106,12 @@ class Events:
     def failed(self, message: str) -> None: ...
 
 
-async def run_council(prompt: str, events: Events, query: Query = query_member) -> Dict[str, Any]:
+async def run_council(prompt: str, events: Events, query: Query = query_member,
+                      roster: Optional[Roster] = None) -> Dict[str, Any]:
     """Run the 3 stages on `prompt` (already folded with follow-up context)."""
+    roster = roster or current_roster()
+    members = roster.active_members()
+    chairman = roster.chair_member()
     result: Dict[str, Any] = {"answers": {}, "errors": {}, "stage1": [], "stage2": [],
                               "label_to_model": {}, "aggregate": [], "failed_reviewers": [],
                               "stage3": None}
@@ -140,17 +139,17 @@ async def run_council(prompt: str, events: Events, query: Query = query_member) 
         resp = await tracked(m, messages, TIMEOUT)
         return m, resp
 
-    for fut in asyncio.as_completed([ask(m) for m in COUNCIL_MEMBERS]):
+    for fut in asyncio.as_completed([ask(m) for m in members]):
         m, resp = await fut
         text = (resp or {}).get("content") if resp else None
         result["answers"][m.name] = text
         if not text:
             result["errors"][m.name] = ERRORS.errors.get(m.name) or "no answer"
     result["stage1"] = [{"model": m.name, "response": result["answers"][m.name]}
-                        for m in COUNCIL_MEMBERS if result["answers"].get(m.name)]
+                        for m in members if result["answers"].get(m.name)]
     if not result["stage1"]:
-        events.failed("Every council member failed to answer. Check that the codex, claude and "
-                      "grok CLIs are installed and signed in, then try again.")
+        events.failed("Every council member failed to answer. Check that their CLIs are installed "
+                      "and signed in (ctrl+e → Test), then try again.")
         return result
 
     # Stages 2 and 3 reuse backend.council; route their member calls through `tracked`.
@@ -158,14 +157,14 @@ async def run_council(prompt: str, events: Events, query: Query = query_member) 
     council.query_member = tracked
     try:
         phase["stage"] = 2
-        stage2, label_to_model = await council.stage2_collect_rankings(prompt, result["stage1"])
+        stage2, label_to_model = await council.stage2_collect_rankings(prompt, result["stage1"], members)
         reviewed = {r["model"] for r in stage2}
         result.update(stage2=stage2, label_to_model=label_to_model,
                       aggregate=council.calculate_aggregate_rankings(stage2, label_to_model),
-                      failed_reviewers=[m.name for m in COUNCIL_MEMBERS if m.name not in reviewed])
+                      failed_reviewers=[m.name for m in members if m.name not in reviewed])
         events.stage2_done(result)
         phase["stage"] = 3
-        result["stage3"] = await council.stage3_synthesize_final(prompt, result["stage1"], stage2)
+        result["stage3"] = await council.stage3_synthesize_final(prompt, result["stage1"], stage2, chairman)
     finally:
         council.query_member = original
     events.stage3_done(result)
@@ -206,10 +205,12 @@ def transcript_markdown(turns: List[Dict[str, Any]], started: datetime) -> str:
     for i, t in enumerate(turns, 1):
         r = t.get("result") or {}
         out += [f"## Question {i}", "", t["question"], ""]
+        names = t.get("members") or list((r.get("answers") or {}).keys())
+        out += [f"_Council: {', '.join(names)} — chair: {t.get('chair', '?')}_", ""]
         out += ["### Stage 1 · Individual answers", ""]
-        for m in COUNCIL_MEMBERS:
-            text = (r.get("answers") or {}).get(m.name)
-            out += [f"#### {m.name}", "", text or f"_Failed: {(r.get('errors') or {}).get(m.name, 'no answer')}_", ""]
+        for name in names:
+            text = (r.get("answers") or {}).get(name)
+            out += [f"#### {name}", "", text or f"_Failed: {(r.get('errors') or {}).get(name, 'no answer')}_", ""]
         if r.get("stage2"):
             out += ["### Stage 2 · Peer review", "", "| # | Member | Avg rank | Votes |", "|---|---|---|---|"]
             for n, a in enumerate(r.get("aggregate") or [], 1):
@@ -262,8 +263,11 @@ class MemberBadge(Static):
 class TurnView(Vertical):
     """One question and its three stages."""
 
-    def __init__(self, n: int, question: str, followup: bool) -> None:
+    def __init__(self, n: int, question: str, followup: bool, roster: Roster) -> None:
         super().__init__(id=f"turn-{n}", classes="turn")
+        self.roster = roster
+        self.members = list(roster.enabled)
+        self.chair_name = roster.chairman
         self.n = n
         self.question = question
         self.followup = followup
@@ -277,16 +281,16 @@ class TurnView(Vertical):
         tag = "follow-up" if self.followup else "question"
         yield Static(f"[{PURPLE}]❯[/] [bold]{_escape(self.question)}[/]  [{DIM}]{tag}[/]", classes="question")
         with Horizontal(classes="badges"):
-            for m in COUNCIL_MEMBERS:
-                b = MemberBadge(m.name, color_for(m.name), id=f"b{self.n}-{slug(m.name)}")
+            for m in self.members:
+                b = MemberBadge(m.name, m.color, id=f"b{self.n}-{slug(m.name)}")
                 self.badges[m.name] = b
                 yield b
-            self.chair = MemberBadge(CHAIRMAN.name, PURPLE, label=f"Chair · {CHAIRMAN.name}",
+            self.chair = MemberBadge(self.chair_name, PURPLE, label=f"Chair · {self.chair_name}",
                                      id=f"b{self.n}-chair", classes="chair")
             yield self.chair
         yield Static("STAGE 1 · INDIVIDUAL ANSWERS", classes="stage-title")
         with TabbedContent(id=f"s1-{self.n}", classes="answers"):
-            for m in COUNCIL_MEMBERS:
+            for m in self.members:
                 with TabPane(self._tab_label(m.name, "busy"), id=self.pane_id(m.name)):
                     yield Markdown(f"*{m.name} is thinking…*", id=f"md-{self.pane_id(m.name)}")
         yield Static("STAGE 2 · PEER REVIEW", classes="stage-title")
@@ -296,13 +300,12 @@ class TurnView(Vertical):
         yield Static("STAGE 3 · CHAIRMAN'S VERDICT", classes="stage-title")
         self.verdict = Markdown(f"*Waiting for the council…*", id=f"verdict-{self.n}")
         box = Vertical(self.verdict, classes="verdict")
-        box.border_title = f"Verdict · {CHAIRMAN.name}"
+        box.border_title = f"Verdict · {self.chair_name}"
         yield box
 
-    @staticmethod
-    def _tab_label(name: str, state: str) -> str:
+    def _tab_label(self, name: str, state: str) -> str:
         mark = {"busy": "…", "done": " ✓", "failed": " ✗"}[state]
-        return f"[{color_for(name)}]●[/] {name}{mark}"
+        return f"[{self.roster.color(name)}]●[/] {name}{mark}"
 
     # -- progress ----------------------------------------------------------
 
@@ -350,7 +353,7 @@ class TurnView(Vertical):
         medals = ["🥇", "🥈", "🥉"]
         for i, a in enumerate(r["aggregate"]):
             table.add_row(medals[i] if i < 3 else str(i + 1),
-                          f"[bold {color_for(a['model'])}]{a['model']}[/]",
+                          f"[bold {self.roster.color(a['model'])}]{a['model']}[/]",
                           f"{a['average_rank']:.2f}", str(a.get("rankings_count", 0)),
                           ", ".join(ranked_by.get(a["model"], [])))
         widgets: List[Any] = [Static(f"[{DIM}]Answers were anonymized; lower average position is better.[/]")]
@@ -411,13 +414,20 @@ class _ThreadEvents(Events):
 # App
 # ---------------------------------------------------------------------------
 
-WELCOME = (
-    f"[bold {TEAL}]●[/]\n[bold {ORANGE}]●[/]   [bold]>_[/]   [bold {PURPLE}]●[/]\n[bold {BLUE}]●[/]\n\n"
-    "[bold]Welcome to the War Room.[/]\n"
-    f"[{DIM}]Ask a question below. {', '.join(m.name for m in COUNCIL_MEMBERS)} answer independently, "
-    f"review each other anonymously, and {CHAIRMAN.name} delivers the verdict.\n"
-    "Follow-ups keep the earlier verdicts as context. ctrl+n starts fresh, ctrl+s saves a transcript.[/]"
-)
+def welcome_text(roster: Roster) -> str:
+    return (
+        f"[bold {TEAL}]●[/]\n[bold {ORANGE}]●[/]   [bold]>_[/]   [bold {PURPLE}]●[/]\n[bold {BLUE}]●[/]\n\n"
+        "[bold]Welcome to the War Room.[/]\n"
+        f"[{DIM}]Ask a question below. {', '.join(m.name for m in roster.enabled)} answer independently, "
+        f"review each other anonymously, and {roster.chairman} delivers the verdict.\n"
+        "Follow-ups keep the earlier verdicts as context. ctrl+n starts fresh, ctrl+s saves a transcript, "
+        "ctrl+e edits the council.[/]"
+    )
+
+
+def roster_bar_text(roster: Roster) -> str:
+    dots = "  ".join(f"[{m.color}]●[/] {_escape(m.name)}" for m in roster.enabled)
+    return f"[{DIM}]COUNCIL[/]  {dots}    [{PURPLE}]◆[/] [{DIM}]chair[/] [bold]{_escape(roster.chairman)}[/]"
 
 
 WAR_ROOM_THEME = Theme(
@@ -455,13 +465,15 @@ class WarRoomApp(App):
     .verdict {{ height: auto; border: round {PURPLE}; border-title-color: {PURPLE};
                 border-title-style: bold; padding: 0 1; background: #251E35; }}
     .verdict Markdown {{ background: #251E35; }}
+    #roster-bar {{ height: 1; padding: 0 2; background: #191919; }}
     #ask {{ dock: bottom; margin: 0 1 0 1; border: tall {PURPLE}; background: #262626; }}
     #ask:focus {{ border: tall {PURPLE}; }}
     """
     BINDINGS = [
+        Binding("ctrl+e", "council", "Council", priority=True),
         Binding("ctrl+n", "new_session", "New session", priority=True),
         Binding("ctrl+s", "save_transcript", "Save transcript", priority=True),
-        Binding("q", "quit_app", "Quit"),
+        Binding("q", "quit_app_q", "Quit"),
         Binding("ctrl+c", "quit_app", "Quit", show=False, priority=True),
         Binding("ctrl+q", "quit_app", "Quit", show=False, priority=True),
         Binding("escape", "leave_input", "Leave input", show=False),
@@ -475,7 +487,18 @@ class WarRoomApp(App):
         self.query_fn: Query = make_fake_query(fake_delay, fake_fail) if fake else query_member
         self.persist = save and not fake
         self.running = False
+        self.roster_warning: Optional[str] = None
+        try:
+            self.roster: Roster = load_roster()
+        except RosterError as e:
+            self.roster = current_roster()
+            self.roster_warning = f"Council config ignored: {e}"
         self._new_state()
+
+    @property
+    def chat_screen(self):
+        """The chat screen (queries must not hit the council settings screen)."""
+        return self.screen_stack[0]
 
     def _new_state(self) -> None:
         self.history: List[Dict[str, str]] = []
@@ -486,22 +509,24 @@ class WarRoomApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static(roster_bar_text(self.roster), id="roster-bar")
         with VerticalScroll(id="log"):
-            yield Static(WELCOME, id="welcome")
+            yield Static(welcome_text(self.roster), id="welcome")
         yield Input(placeholder="Ask the council…  (Enter to send)", id="ask")
         yield Footer()
 
     def on_mount(self) -> None:
         self.register_theme(WAR_ROOM_THEME)
         self.theme = "war-room"
-        members = " · ".join(m.name for m in COUNCIL_MEMBERS)
-        self.sub_title = f"{members} — chair: {CHAIRMAN.name}" + ("  [FAKE MODE]" if self.fake else "")
-        self.query_one("#ask", Input).focus()
+        self._refresh_roster_ui()
+        if self.roster_warning:
+            self.notify(self.roster_warning, severity="warning", timeout=10)
+        self.chat_screen.query_one("#ask", Input).focus()
         if self.initial_question:
             self.call_after_refresh(self._ask_initial)
 
     async def _ask_initial(self) -> None:
-        inp = self.query_one("#ask", Input)
+        inp = self.chat_screen.query_one("#ask", Input)
         inp.value = self.initial_question or ""
         await inp.action_submit()
 
@@ -509,7 +534,7 @@ class WarRoomApp(App):
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         question = event.value.strip()
-        if not question:
+        if not question or event.input.id != "ask":
             return
         if self.running:
             self.notify("The council is still in session; wait for the verdict.", severity="warning")
@@ -517,15 +542,17 @@ class WarRoomApp(App):
         event.input.value = ""
         prompt = build_followup_question(self.history, question)
         self.turn_count += 1
-        log = self.query_one("#log", VerticalScroll)
+        log = self.chat_screen.query_one("#log", VerticalScroll)
         for w in log.query("#welcome"):
             await w.remove()
-        turn = TurnView(self.turn_count, question, followup=bool(self.history))
+        roster = self.roster.copy()  # roster edits apply from the next question
+        turn = TurnView(self.turn_count, question, followup=bool(self.history), roster=roster)
         await log.mount(turn)
         log.scroll_end(animate=False)
         self.running = True
         event.input.placeholder = "Council in session…"
-        record = {"question": question, "prompt": prompt, "result": None, "error": None}
+        record = {"question": question, "prompt": prompt, "result": None, "error": None,
+                  "roster": roster, "members": [m.name for m in roster.enabled], "chair": roster.chairman}
         self.turns.append(record)
         self.run_turn(turn, record)
 
@@ -533,7 +560,8 @@ class WarRoomApp(App):
     def run_turn(self, turn: TurnView, record: Dict[str, Any]) -> None:
         events = _ThreadEvents(self, turn)
         try:
-            record["result"] = asyncio.run(run_council(record["prompt"], events, self.query_fn))
+            record["result"] = asyncio.run(run_council(record["prompt"], events, self.query_fn,
+                                                      record["roster"]))
         except Exception as e:  # never leave the UI stuck "in session"
             record["error"] = f"The council hit an error: {type(e).__name__}: {str(e)[:300]}"
             events.failed(record["error"])
@@ -544,7 +572,7 @@ class WarRoomApp(App):
 
     def _turn_finished(self, record: Dict[str, Any]) -> None:
         self.running = False
-        inp = self.query_one("#ask", Input)
+        inp = self.chat_screen.query_one("#ask", Input)
         inp.placeholder = "Ask a follow-up…  (Enter to send · ctrl+n for a new session)"
         r = record.get("result") or {}
         verdict = (r.get("stage3") or {}).get("response")
@@ -575,11 +603,11 @@ class WarRoomApp(App):
         if self.running:
             self.notify("The council is still in session; wait for the verdict first.", severity="warning")
             return
-        log = self.query_one("#log", VerticalScroll)
+        log = self.chat_screen.query_one("#log", VerticalScroll)
         await log.remove_children()
-        await log.mount(Static(WELCOME, id="welcome"))
+        await log.mount(Static(welcome_text(self.roster), id="welcome"))
         self._new_state()
-        inp = self.query_one("#ask", Input)
+        inp = self.chat_screen.query_one("#ask", Input)
         inp.placeholder = "Ask the council…  (Enter to send)"
         inp.focus()
         self.notify("New session started.")
@@ -602,8 +630,40 @@ class WarRoomApp(App):
         self.notify(f"Saved transcript to {path}")
         return path
 
+    # -- council settings -----------------------------------------------------
+
+    council_models = None  # tests inject a model lister here
+
+    def check_action(self, action: str, parameters) -> Optional[bool]:
+        # On the settings screen, its own keys win (ctrl+s saves the roster there).
+        if isinstance(self.screen, CouncilScreen) and action in (
+                "new_session", "save_transcript", "council", "quit_app_q"):
+            return False
+        return True
+
+    def action_council(self) -> None:
+        self.push_screen(CouncilScreen(self.roster, query=self.query_fn, check_cli=not self.fake,
+                                       models=self.council_models), self._council_closed)
+
+    def _council_closed(self, roster: Optional[Roster]) -> None:
+        if roster is None:
+            return
+        self.roster = roster.copy()
+        self._refresh_roster_ui()
+        later = " The council already in session keeps its old roster." if self.running else ""
+        self.notify(f"Council saved: {roster.summary()}. Applies to the next question.{later}")
+
+    def _refresh_roster_ui(self) -> None:
+        self.sub_title = self.roster.summary() + ("  [FAKE MODE]" if self.fake else "")
+        self.chat_screen.query_one("#roster-bar", Static).update(roster_bar_text(self.roster))
+        for w in self.chat_screen.query("#welcome"):
+            w.update(welcome_text(self.roster))
+
     def action_leave_input(self) -> None:
         self.set_focus(None)
+
+    def action_quit_app_q(self) -> None:
+        self.action_quit_app()
 
     def action_quit_app(self) -> None:
         kill_active_processes(signal.SIGTERM)

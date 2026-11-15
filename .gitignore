@@ -21,3 +21,6 @@ frontend/dist/
 frontend/.vite/
 # macOS
 .DS_Store
+
+# War Room roster (normally ~/.config/war-room/council.json)
+council.json

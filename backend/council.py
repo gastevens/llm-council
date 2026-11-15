@@ -3,7 +3,8 @@
 from typing import List, Dict, Any, Optional, Tuple
 import asyncio
 
-from .config import COUNCIL_MEMBERS, CHAIRMAN, TITLE_MEMBER, TIMEOUT
+from .config import TIMEOUT
+from .council_config import current_roster
 from .providers import Member, query_member
 
 
@@ -18,7 +19,7 @@ async def query_members_parallel(
     return {m.name: r for m, r in zip(members, responses)}
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(user_query: str, members: Optional[List[Member]] = None) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
@@ -30,8 +31,9 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     """
     messages = [{"role": "user", "content": user_query}]
 
-    # Query all models in parallel
-    responses = await query_members_parallel(COUNCIL_MEMBERS, messages)
+    # Query all models in parallel (enabled roster members unless given)
+    members = members if members is not None else current_roster().active_members()
+    responses = await query_members_parallel(members, messages)
 
     # Format results
     stage1_results = []
@@ -47,7 +49,8 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
 
 async def stage2_collect_rankings(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
+    members: Optional[List[Member]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -108,7 +111,8 @@ Now provide your evaluation and ranking:"""
     messages = [{"role": "user", "content": ranking_prompt}]
 
     # Get rankings from all council models in parallel
-    responses = await query_members_parallel(COUNCIL_MEMBERS, messages)
+    members = members if members is not None else current_roster().active_members()
+    responses = await query_members_parallel(members, messages)
 
     # Format results
     stage2_results = []
@@ -128,7 +132,8 @@ Now provide your evaluation and ranking:"""
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    chairman: Optional[Member] = None,
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -172,17 +177,18 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     messages = [{"role": "user", "content": chairman_prompt}]
 
     # Query the chairman model
-    response = await query_member(CHAIRMAN, messages, timeout=TIMEOUT)
+    chairman = chairman or current_roster().chair_member()
+    response = await query_member(chairman, messages, timeout=TIMEOUT)
 
     if response is None:
         # Fallback if chairman fails
         return {
-            "model": CHAIRMAN.name,
+            "model": chairman.name,
             "response": "Error: Unable to generate final synthesis."
         }
 
     return {
-        "model": CHAIRMAN.name,
+        "model": chairman.name,
         "response": response.get('content', '')
     }
 
@@ -268,7 +274,7 @@ def calculate_aggregate_rankings(
     return aggregate
 
 
-async def generate_conversation_title(user_query: str) -> str:
+async def generate_conversation_title(user_query: str, member: Optional[Member] = None) -> str:
     """
     Generate a short title for a conversation based on the first user message.
 
@@ -288,7 +294,8 @@ Title:"""
     messages = [{"role": "user", "content": title_prompt}]
 
     # Use a fast member for title generation (configurable via COUNCIL_TITLE_MEMBER)
-    response = await query_member(TITLE_MEMBER, messages, timeout=90.0)
+    member = member or current_roster().title_member_obj()
+    response = await query_member(member, messages, timeout=90.0)
 
     if response is None:
         # Fallback: first few words of the question
@@ -307,7 +314,7 @@ Title:"""
     return title
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
+async def run_full_council(user_query: str, roster=None) -> Tuple[List, List, Dict, Dict]:
     """
     Run the complete 3-stage council process.
 
@@ -317,8 +324,11 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
+    roster = roster or current_roster()
+    members = roster.active_members()
+
     # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
+    stage1_results = await stage1_collect_responses(user_query, members)
 
     # If no models responded successfully, return error
     if not stage1_results:
@@ -328,7 +338,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         }, {}
 
     # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, members)
 
     # Calculate aggregate rankings
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -337,7 +347,8 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
-        stage2_results
+        stage2_results,
+        roster.chair_member(),
     )
 
     # Prepare metadata

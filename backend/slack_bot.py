@@ -6,7 +6,7 @@
 
 Triggers:
   * @War Room <question> in any channel the bot is in (intended: #war-room)
-  * /warroom <question>
+  * /warroom <question>    (/warroom roster shows the current council)
   * any plain reply inside a War Room thread = follow-up question (earlier
     questions and verdicts from the thread are included as context)
 
@@ -34,7 +34,8 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")  # before config import so launchd runs see .env
 
-from .config import CHAIRMAN, COUNCIL_MEMBERS, TIMEOUT  # noqa: E402
+from .config import TIMEOUT  # noqa: E402
+from .council_config import Roster, config_path, current_roster, roster_lines  # noqa: E402
 from .council import (  # noqa: E402
     calculate_aggregate_rankings,
     stage2_collect_rankings,
@@ -66,7 +67,8 @@ Post = Callable[[str], None]
 # ---------------------------------------------------------------------------
 
 async def deliberate(question: str, post: Post, critique_chars: int = CRITIQUE_CHARS,
-                     query: Callable[..., Awaitable] = query_member) -> Dict:
+                     query: Callable[..., Awaitable] = query_member,
+                     roster: Optional[Roster] = None) -> Dict:
     """Run the 3-stage council, calling post(text) for every Slack message.
 
     Stage 1 answers are posted one per member as soon as each finishes.
@@ -76,31 +78,34 @@ async def deliberate(question: str, post: Post, critique_chars: int = CRITIQUE_C
         for t in texts:
             await asyncio.to_thread(post, t)
 
+    roster = roster or current_roster()
+    members = roster.active_members()
+    chairman = roster.chair_member()
     messages = [{"role": "user", "content": question}]
 
     async def ask(m: Member):
         return m, await query(m, messages, timeout=TIMEOUT)
 
     answers: Dict[str, Optional[str]] = {}
-    for fut in asyncio.as_completed([ask(m) for m in COUNCIL_MEMBERS]):
+    for fut in asyncio.as_completed([ask(m) for m in members]):
         member, resp = await fut
         text = (resp or {}).get("content") if resp else None
         answers[member.name] = text
         await say(format_member_answer(member.name, text))
 
     stage1 = [{"model": m.name, "response": answers[m.name]}
-              for m in COUNCIL_MEMBERS if answers.get(m.name)]
+              for m in members if answers.get(m.name)]
     if not stage1:
         await say([":x: Every council member failed to answer. Check that the CLIs are signed in on the Mac mini, then try again."])
         return {"model": "error", "response": "All models failed to respond."}
 
-    stage2, label_to_model = await stage2_collect_rankings(question, stage1)
+    stage2, label_to_model = await stage2_collect_rankings(question, stage1, members)
     aggregate = calculate_aggregate_rankings(stage2, label_to_model)
     reviewed = {r["model"] for r in stage2}
-    failed = [m.name for m in COUNCIL_MEMBERS if m.name not in reviewed]
+    failed = [m.name for m in members if m.name not in reviewed]
     await say(format_rankings(stage2, label_to_model, aggregate, critique_chars, failed))
 
-    stage3 = await stage3_synthesize_final(question, stage1, stage2)
+    stage3 = await stage3_synthesize_final(question, stage1, stage2, chairman)
     await say(format_verdict(stage3))
     return stage3
 
@@ -111,8 +116,9 @@ def run_council_thread(question: str, post: Post, slots: threading.BoundedSemaph
         post(":hourglass_flowing_sand: Another council is in session; yours is queued and will start when it finishes.")
         slots.acquire()
     try:
-        post(convening_text([m.name for m in COUNCIL_MEMBERS], CHAIRMAN.name))
-        asyncio.run(deliberate(question, post))
+        roster = current_roster()  # read per question, so roster edits apply to the next one
+        post(convening_text([m.name for m in roster.enabled], roster.chairman))
+        asyncio.run(deliberate(question, post, roster=roster))
     except Exception as e:  # never leave the thread hanging silently
         log.exception("council run failed")
         post(f":x: The council hit an error: `{type(e).__name__}: {str(e)[:300]}`")
@@ -159,6 +165,14 @@ def thread_history(client, channel: str, thread_ts: str, bot_user_id: str,
             if q:
                 history.append({"role": "user", "text": q})
     return history
+
+
+def roster_text(roster: Roster) -> str:
+    """Ephemeral reply for `/warroom roster`."""
+    head = f":classical_building: *War Room council* — chair: *{roster.chairman}*"
+    tail = ("_Edit it in the War Room TUI (ctrl+e) or with "
+            "`uv run python -m backend.council_config` on the Mac mini._")
+    return "\n".join([head, *roster_lines(roster, markdown=True), tail])
 
 
 def build_app(**app_kwargs):
@@ -224,7 +238,10 @@ def build_app(**app_kwargs):
         ack()
         question = (command.get("text") or "").strip()
         if not question:
-            respond("Usage: `/warroom <question>`")
+            respond("Usage: `/warroom <question>` (or `/warroom roster` to see the council)")
+            return
+        if question.lower() == "roster":
+            respond(roster_text(current_roster()))
             return
         try:
             root = client.chat_postMessage(
@@ -267,13 +284,14 @@ def dry_run(question: str, fake: bool) -> None:
         n += 1
         print(f"\n----- Slack message {n} ({len(text)} chars) -----\n{text}")
 
-    post(convening_text([m.name for m in COUNCIL_MEMBERS], CHAIRMAN.name))
+    roster = current_roster()
+    post(convening_text([m.name for m in roster.enabled], roster.chairman))
     if fake:
         import backend.council as council
         council.query_member = _fake_query  # stage 2/3 helpers look this up at call time
-        asyncio.run(deliberate(question, post, query=_fake_query))
+        asyncio.run(deliberate(question, post, query=_fake_query, roster=roster))
     else:
-        asyncio.run(deliberate(question, post))
+        asyncio.run(deliberate(question, post, roster=roster))
     print(f"\n===== {n} messages would be posted =====")
 
 
@@ -299,8 +317,10 @@ def main() -> None:
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     app = build_app()
-    log.info("War Room connecting via Socket Mode (members: %s; chairman: %s)",
-             ", ".join(m.name for m in COUNCIL_MEMBERS), CHAIRMAN.name)
+    roster = current_roster()
+    log.info("War Room connecting via Socket Mode (members: %s; chairman: %s; roster: %s)",
+             ", ".join(m.name for m in roster.enabled), roster.chairman,
+             config_path() if roster.source == "file" else "env defaults")
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
 
 
