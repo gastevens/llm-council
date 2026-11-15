@@ -10,6 +10,45 @@ In a bit more detail, here is what happens when you submit a query:
 2. **Stage 2: Review**. Each individual LLM is given the responses of the other LLMs. Under the hood, the LLM identities are anonymized so that the LLM can't play favorites when judging their outputs. The LLM is asked to rank them in accuracy and insight.
 3. **Stage 3: Final response**. The designated Chairman of the LLM Council takes all of the model's responses and compiles them into a single final answer that is presented to the user.
 
+## War Room fork: run on your subscriptions (no API keys)
+
+This `war-room` branch replaces OpenRouter with the coding CLIs you are already
+signed into, so the council runs on your ChatGPT, Claude and Grok plans:
+
+| Member  | CLI | Sign in once with |
+|---------|-----|-------------------|
+| ChatGPT | [Codex CLI](https://github.com/openai/codex) (`codex exec`) | `codex login` (ChatGPT plan) |
+| Claude  | [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude -p`) | `claude` then `/login` (Claude plan) |
+| Grok    | Grok Build (`grok -p`) | `grok login` (grok.com plan) |
+
+Each call runs as a one-shot subprocess in an empty temporary directory with
+tools disabled (Codex: read-only sandbox), so members only answer and never
+touch your files. Usage counts against each plan's normal limits.
+
+Run it:
+
+```bash
+uv sync
+(cd frontend && npm install)
+./start.sh            # then open http://localhost:5173
+# or, headless:
+uv run python -m backend.ask "Should we self-host email?"
+```
+
+Configure with environment variables (or `.env`):
+
+```bash
+COUNCIL_MEMBERS=chatgpt,claude,grok      # add a model override: claude:claude-opus-5
+COUNCIL_CHAIRMAN=claude                  # who writes the final verdict
+COUNCIL_TITLE_MEMBER=grok                # who names conversations
+COUNCIL_TIMEOUT=300                      # seconds per call
+# Optional OpenRouter members still work:
+# COUNCIL_MEMBERS=chatgpt,claude,grok,openrouter:google/gemini-3-pro-preview
+# OPENROUTER_API_KEY=sk-or-v1-...
+```
+
+A full three-stage round with three members takes about a minute.
+
 ## Vibe Code Alert
 
 This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.

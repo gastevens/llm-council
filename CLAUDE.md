@@ -16,6 +16,11 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
 - Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
 
+**`providers.py`** (war-room branch)
+- Council members are `Member(name, provider, model)`; providers are `codex`, `claude`, `grok` (subscription CLIs run as one-shot subprocesses in an empty temp dir, tools disabled) or `openrouter`
+- `query_member()` returns `{'content': ...}` or None on failure
+- Members/chairman configured in `config.py` via `COUNCIL_MEMBERS`, `COUNCIL_CHAIRMAN`, `COUNCIL_TITLE_MEMBER`, `COUNCIL_TIMEOUT`
+
 **`openrouter.py`**
 - `query_model()`: Single async model query
 - `query_models_parallel()`: Parallel queries using `asyncio.gather()`
