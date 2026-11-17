@@ -60,6 +60,19 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(ev.calls[-1][0], "failed")
 
 
+class ContextCommandParseTests(unittest.TestCase):
+    def test_parse(self):
+        p = tui.parse_context_command
+        self.assertIsNone(p("What is context?"))
+        self.assertIsNone(p("/contextual"))
+        self.assertEqual(p("/context"), {"action": "show"})
+        self.assertEqual(p("/context off"), {"action": "off"})
+        self.assertEqual(p("/context ~/My Docs/plan"), {"action": "set", "path": "~/My Docs/plan", "mode": None})
+        self.assertEqual(p('/context "~/a b" --folder'), {"action": "set", "path": "~/a b", "mode": "folder"})
+        self.assertEqual(p("/context --inline ./x"), {"action": "set", "path": "./x", "mode": "inline"})
+        self.assertEqual(p("/context --folder")["action"], "error")
+
+
 class AppTests(unittest.IsolatedAsyncioTestCase):
     async def ask(self, app, pilot, question):
         app.query_one("#ask", Input).value = question
@@ -132,6 +145,73 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertEqual(app.turns[0]["question"], "Tabs or spaces?")
             self.assertTrue((app.turns[0]["result"] or {}).get("stage3"))
+
+    async def test_context_command_and_transcript(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "plan.md").write_text("Codename HERON.\n")
+            (Path(d) / "budget.txt").write_text("42 dollars\n")
+            seen = []
+            app = tui.WarRoomApp(fake=True, fake_delay=0, launch_cwd=d)
+            base_query = app.query_fn
+
+            async def spy(member, messages, timeout):
+                seen.append(messages[0]["content"])
+                return await base_query(member, messages, timeout=timeout)
+
+            app.query_fn = spy
+            async with app.run_test(size=(160, 50)) as pilot:
+                app.query_one("#ask", Input).value = "/context ."
+                await pilot.press("enter")
+                for _ in range(100):
+                    await pilot.pause(0.05)
+                    if app.context is not None:
+                        break
+                self.assertIsNotNone(app.context)
+                self.assertEqual(app.context.mode, "inline")
+                bar = str(app.query_one("#roster-bar").render())
+                self.assertIn("2 files", bar)
+                self.assertIn("inline", bar)
+                self.assertEqual(app.turns, [])  # /context is not a question
+
+                await self.ask(app, pilot, "What is the codename?")
+                self.assertTrue(any("===== FILE: plan.md" in p and "HERON" in p for p in seen))
+                self.assertEqual(app.turns[0]["context"]["files"], ["budget.txt", "plan.md"])
+                md = tui.transcript_markdown(app.turns, app.started)
+                self.assertIn("Context folder", md)
+                self.assertIn("`plan.md`", md)
+
+                app.query_one("#ask", Input).value = "/context /definitely/not/here"
+                await pilot.press("enter")
+                await pilot.pause(0.3)
+                self.assertIsNotNone(app.context)  # bad path keeps the old context
+
+                app.query_one("#ask", Input).value = "/context off"
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertIsNone(app.context)
+
+                app.query_one("#ask", Input).value = f"/context {d} --folder"
+                await pilot.press("enter")
+                for _ in range(100):
+                    await pilot.pause(0.05)
+                    if app.context is not None:
+                        break
+                self.assertEqual(app.context.mode, "folder")
+                await pilot.press("ctrl+n")
+                await pilot.pause()
+                self.assertIsNone(app.context)  # new session clears the context
+
+    async def test_context_on_launch(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "a.txt").write_text("hello\n")
+            app = tui.WarRoomApp(fake=True, fake_delay=0, context=d, ask="Summarize")
+            async with app.run_test(size=(120, 40)) as pilot:
+                for _ in range(200):
+                    await pilot.pause(0.05)
+                    if app.turns and not app.running:
+                        break
+                self.assertIsNotNone(app.context)
+                self.assertEqual(app.turns[0]["context"]["files"], ["a.txt"])
 
     async def test_quit_key(self):
         app = tui.WarRoomApp(fake=True, fake_delay=0)

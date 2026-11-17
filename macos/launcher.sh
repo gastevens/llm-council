@@ -3,7 +3,10 @@
 # TUI and waits for it. Closing the window quits that Ghostty instance (and the
 # TUI with it), which in turn ends this launcher, so the app fully shuts down.
 
-RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+# Lives in Contents/Resources (started by the Swift executable) or, as a
+# fallback, is the executable itself in Contents/MacOS.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$HERE/war-room-session.sh" ]; then RES="$HERE"; else RES="$(cd "$HERE/../Resources" && pwd)"; fi
 GHOSTTY="/Applications/Ghostty.app"
 [ -d "$GHOSTTY" ] || GHOSTTY="$HOME/Applications/Ghostty.app"
 
@@ -12,7 +15,8 @@ if [ ! -d "$GHOSTTY" ]; then
   exit 1
 fi
 
-# Extra arguments (e.g. `open -a "War Room" --args --fake`) go to the TUI.
+# Extra arguments (e.g. `open -a "War Room" --args --fake`, or the
+# `--context PATH` the app adds for a dropped folder) go to the TUI.
 args=()
 for a in "$@"; do [[ "$a" == -psn_* ]] || args+=("$a"); done
 

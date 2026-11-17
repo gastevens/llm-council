@@ -7,6 +7,20 @@ Grok Build -> grok.com plan) or, optionally, through OpenRouter.
 Every CLI call runs as a one-shot, non-interactive subprocess inside a fresh,
 empty temporary directory with tools disabled (or, for Codex, a read-only
 sandbox), so council members answer from the model only and never touch files.
+
+Exception: while a *folder-mode* context is active (see ``use_context`` and
+``backend.context``), CLI members run with that folder as their working
+directory and READ-ONLY file tools so they can open the files themselves:
+
+    codex   --sandbox read-only --cd FOLDER, web search disabled
+            (it reads with shell commands; the sandbox blocks writes and network)
+    claude  --tools Read,Glob,Grep, --permission-mode dontAsk (no Bash/Edit/Write/Web)
+    grok    --tools read_file,list_dir,grep --sandbox read-only --permission-mode dontAsk
+            --disable-web-search --no-subagents
+
+OpenRouter members have no file access, so they get the files pasted inline
+(truncated to the budget) instead. Folder-mode calls get COUNCIL_TIMEOUT x
+COUNCIL_CONTEXT_TIMEOUT_FACTOR (default 2).
 """
 
 import asyncio
@@ -16,6 +30,8 @@ import os
 import shutil
 import signal
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
@@ -69,6 +85,42 @@ CLI_PREAMBLE = (
     "Answer directly from your own knowledge in Markdown. Do not run commands, "
     "read or write files, or ask follow-up questions.\n\n"
 )
+
+
+FOLDER_PREAMBLE = (
+    "You are a member of a council of AI models answering a user's question about the files "
+    "in your current working directory. You may list, read and search those files with your "
+    "read-only tools (for a shell, only read-only commands such as ls, cat, head, rg). Do not "
+    "create, modify or delete files, install anything, browse the web, or ask follow-up "
+    "questions. Answer in Markdown and cite the file paths you rely on.\n\n"
+)
+
+# The context folder for the council run in progress (a backend.context.FolderContext).
+# asyncio tasks copy context variables when they are created, so setting this
+# around a council run reaches every member call made inside it.
+_CONTEXT: ContextVar[Optional[Any]] = ContextVar("council_context", default=None)
+
+
+@contextmanager
+def use_context(ctx: Optional[Any]):
+    """Make `ctx` the active context folder for member calls inside the block."""
+    token = _CONTEXT.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _CONTEXT.reset(token)
+
+
+def active_context() -> Optional[Any]:
+    return _CONTEXT.get()
+
+
+def folder_timeout(timeout: float) -> float:
+    try:
+        factor = float(os.getenv("COUNCIL_CONTEXT_TIMEOUT_FACTOR", "2") or 2)
+    except ValueError:
+        factor = 2.0
+    return timeout * max(1.0, factor)
 
 
 def _which(binary: str) -> str:
@@ -126,20 +178,76 @@ def _killpg(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
-async def _query_codex(member: Member, prompt: str, workdir: str, timeout: float) -> str:
-    out_file = os.path.join(workdir, ".codex-last-message.txt")
+def codex_cmd(member: Member, workdir: str, out_file: str, folder: Optional[str] = None) -> List[str]:
     cmd = [
         _which("codex"), "exec",
         "--skip-git-repo-check", "--ephemeral",
         "--sandbox", "read-only",
         "--color", "never",
-        "--cd", workdir,
+        "--cd", folder or workdir,
         "--output-last-message", out_file,
     ]
+    if folder:
+        cmd += ["-c", 'web_search="disabled"']
     if member.model:
         cmd += ["--model", member.model]
     cmd.append("-")  # read prompt from stdin
-    stdout = await _run(cmd, prompt, workdir, timeout)
+    return cmd
+
+
+CLAUDE_READ_TOOLS = "Read,Glob,Grep"
+CLAUDE_DENY = "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task"
+
+
+def claude_cmd(member: Member, folder: Optional[str] = None) -> List[str]:
+    cmd = [_which("claude"), "-p"]
+    if folder:
+        cmd += [
+            "--tools", CLAUDE_READ_TOOLS,
+            "--allowedTools", CLAUDE_READ_TOOLS,
+            "--disallowedTools", CLAUDE_DENY,
+            "--permission-mode", "dontAsk",
+            "--add-dir", folder,
+        ]
+    else:
+        cmd += ["--tools", ""]
+    cmd += [
+        "--strict-mcp-config",
+        "--setting-sources", "",
+        "--no-session-persistence",
+        "--output-format", "json",
+    ]
+    if member.model:
+        cmd += ["--model", member.model]
+    return cmd
+
+
+GROK_READ_TOOLS = "read_file,list_dir,grep"
+
+
+def grok_cmd(member: Member, prompt_file: str, workdir: str, folder: Optional[str] = None) -> List[str]:
+    cmd = [_which("grok"), "--prompt-file", prompt_file]
+    if folder:
+        cmd += ["--tools", GROK_READ_TOOLS, "--permission-mode", "dontAsk", "--sandbox", "read-only"]
+    else:
+        cmd += ["--tools", ""]
+    cmd += [
+        "--disable-web-search",
+        "--no-subagents",
+        "--verbatim",
+        "--cwd", folder or workdir,
+        "--output-format", "json",
+    ]
+    if member.model:
+        cmd += ["--model", member.model]
+    return cmd
+
+
+async def _query_codex(member: Member, prompt: str, workdir: str, timeout: float,
+                       folder: Optional[str] = None) -> str:
+    out_file = os.path.join(workdir, ".codex-last-message.txt")
+    cmd = codex_cmd(member, workdir, out_file, folder)
+    stdout = await _run(cmd, prompt, folder or workdir, timeout)
     if os.path.exists(out_file):
         with open(out_file, encoding="utf-8") as f:
             text = f.read().strip()
@@ -148,41 +256,22 @@ async def _query_codex(member: Member, prompt: str, workdir: str, timeout: float
     return stdout.strip()
 
 
-async def _query_claude(member: Member, prompt: str, workdir: str, timeout: float) -> str:
-    cmd = [
-        _which("claude"), "-p",
-        "--tools", "",
-        "--strict-mcp-config",
-        "--setting-sources", "",
-        "--no-session-persistence",
-        "--output-format", "json",
-    ]
-    if member.model:
-        cmd += ["--model", member.model]
-    stdout = await _run(cmd, prompt, workdir, timeout)
+async def _query_claude(member: Member, prompt: str, workdir: str, timeout: float,
+                        folder: Optional[str] = None) -> str:
+    stdout = await _run(claude_cmd(member, folder), prompt, folder or workdir, timeout)
     data = json.loads(stdout)
     if data.get("is_error"):
         raise RuntimeError(f"claude error: {str(data.get('result'))[:300]}")
     return (data.get("result") or "").strip()
 
 
-async def _query_grok(member: Member, prompt: str, workdir: str, timeout: float) -> str:
+async def _query_grok(member: Member, prompt: str, workdir: str, timeout: float,
+                      folder: Optional[str] = None) -> str:
+    # The prompt file lives in the scratch dir, never inside the shared folder.
     prompt_file = os.path.join(workdir, ".grok-prompt.txt")
     with open(prompt_file, "w", encoding="utf-8") as f:
         f.write(prompt)
-    cmd = [
-        _which("grok"),
-        "--prompt-file", prompt_file,
-        "--tools", "",
-        "--disable-web-search",
-        "--no-subagents",
-        "--verbatim",
-        "--cwd", workdir,
-        "--output-format", "json",
-    ]
-    if member.model:
-        cmd += ["--model", member.model]
-    stdout = await _run(cmd, None, workdir, timeout)
+    stdout = await _run(grok_cmd(member, prompt_file, workdir, folder), None, folder or workdir, timeout)
     data = json.loads(stdout)
     return (data.get("text") or "").strip()
 
@@ -202,20 +291,39 @@ _CLI_HANDLERS = {
 }
 
 
+def _inline_fallback(messages: List[Dict[str, str]], ctx: Any) -> List[Dict[str, str]]:
+    """For members without file tools in folder mode: paste what fits instead."""
+    from .context import inline_block
+    note = ("(You have no file access, so as much of the folder as fits is pasted here; "
+            "files marked 'Not included' weren't available to you.)\n\n")
+    first = dict(messages[0])
+    first["content"] = note + inline_block(ctx) + "\n\n---\n\n" + first["content"]
+    return [first] + list(messages[1:])
+
+
 async def query_member(
     member: Member,
     messages: List[Dict[str, str]],
     timeout: float,
 ) -> Optional[Dict[str, Any]]:
     """Query one council member. Returns {'content': ...} or None on failure."""
+    ctx = _CONTEXT.get()
+    folder = str(ctx.root if ctx.root.is_dir() else ctx.root.parent) if (
+        ctx is not None and getattr(ctx, "mode", None) == "folder") else None
     try:
         if member.provider == "openrouter":
+            if folder:
+                messages = _inline_fallback(messages, ctx)
             content = await _query_openrouter(member, messages, timeout)
         else:
             handler = _CLI_HANDLERS[member.provider]
-            prompt = CLI_PREAMBLE + _messages_to_prompt(messages)
+            preamble = FOLDER_PREAMBLE if folder else CLI_PREAMBLE
+            prompt = preamble + _messages_to_prompt(messages)
             with tempfile.TemporaryDirectory(prefix="llm-council-") as workdir:
-                content = await handler(member, prompt, workdir, timeout)
+                if folder:
+                    content = await handler(member, prompt, workdir, folder_timeout(timeout), folder)
+                else:
+                    content = await handler(member, prompt, workdir, timeout)
         if not content:
             raise RuntimeError("empty response")
         return {"content": content}

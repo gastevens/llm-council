@@ -33,9 +33,22 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 # --- scripts (repo path baked in)
-sed "s|__REPO__|$REPO|g" "$REPO/macos/launcher.sh" > "$APP/Contents/MacOS/war-room"
+sed "s|__REPO__|$REPO|g" "$REPO/macos/launcher.sh" > "$APP/Contents/Resources/launcher.sh"
 sed "s|__REPO__|$REPO|g" "$REPO/macos/war-room-session.sh" > "$APP/Contents/Resources/war-room-session.sh"
-chmod +x "$APP/Contents/MacOS/war-room" "$APP/Contents/Resources/war-room-session.sh"
+chmod +x "$APP/Contents/Resources/launcher.sh" "$APP/Contents/Resources/war-room-session.sh"
+
+# --- executable: a tiny Swift app so folders dropped on the icon (or
+# `open -a "War Room" ~/folder`) become the context folder. Without swiftc,
+# fall back to the plain launcher script (no drag-and-drop).
+SWIFTC="$(command -v swiftc || true)"
+if [ -n "$SWIFTC" ] && "$SWIFTC" -O -o "$APP/Contents/MacOS/war-room" "$REPO/macos/WarRoomLauncher.swift" 2>"$TMP/swiftc.log"; then
+  :
+else
+  echo "swiftc unavailable or failed; using the script launcher (no folder drag-and-drop)." >&2
+  [ -s "$TMP/swiftc.log" ] && cat "$TMP/swiftc.log" >&2
+  cp "$APP/Contents/Resources/launcher.sh" "$APP/Contents/MacOS/war-room"
+fi
+chmod +x "$APP/Contents/MacOS/war-room"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -51,6 +64,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
+<key>CFBundleDocumentTypes</key>
+<array><dict>
+  <key>CFBundleTypeName</key><string>Context folder</string>
+  <key>CFBundleTypeRole</key><string>Viewer</string>
+  <key>LSHandlerRank</key><string>Alternate</string>
+  <key>LSItemContentTypes</key><array><string>public.folder</string><string>public.item</string></array>
+</dict></array>
 </dict></plist>
 PLIST
 

@@ -5,7 +5,8 @@ import asyncio
 
 from .config import TIMEOUT
 from .council_config import current_roster
-from .providers import Member, query_member
+from .context import FolderContext, review_prefix, stage1_prompt
+from .providers import Member, query_member, use_context
 
 
 async def query_members_parallel(
@@ -19,7 +20,8 @@ async def query_members_parallel(
     return {m.name: r for m, r in zip(members, responses)}
 
 
-async def stage1_collect_responses(user_query: str, members: Optional[List[Member]] = None) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(user_query: str, members: Optional[List[Member]] = None,
+                                   context: Optional[FolderContext] = None) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
@@ -29,7 +31,7 @@ async def stage1_collect_responses(user_query: str, members: Optional[List[Membe
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
+    messages = [{"role": "user", "content": stage1_prompt(user_query, context)}]
 
     # Query all models in parallel (enabled roster members unless given)
     members = members if members is not None else current_roster().active_members()
@@ -51,6 +53,7 @@ async def stage2_collect_rankings(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
     members: Optional[List[Member]] = None,
+    context: Optional[FolderContext] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -108,7 +111,7 @@ FINAL RANKING:
 
 Now provide your evaluation and ranking:"""
 
-    messages = [{"role": "user", "content": ranking_prompt}]
+    messages = [{"role": "user", "content": review_prefix(context) + ranking_prompt}]
 
     # Get rankings from all council models in parallel
     members = members if members is not None else current_roster().active_members()
@@ -134,6 +137,7 @@ async def stage3_synthesize_final(
     stage1_results: List[Dict[str, Any]],
     stage2_results: List[Dict[str, Any]],
     chairman: Optional[Member] = None,
+    context: Optional[FolderContext] = None,
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -174,7 +178,9 @@ Your task as Chairman is to synthesize all of this information into a single, co
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
-    messages = [{"role": "user", "content": chairman_prompt}]
+    if context is not None:
+        chairman_prompt += "\n\nCite the file paths that support the key points."
+    messages = [{"role": "user", "content": review_prefix(context, role="chair") + chairman_prompt}]
 
     # Query the chairman model
     chairman = chairman or current_roster().chair_member()
@@ -314,7 +320,8 @@ Title:"""
     return title
 
 
-async def run_full_council(user_query: str, roster=None) -> Tuple[List, List, Dict, Dict]:
+async def run_full_council(user_query: str, roster=None,
+                           context: Optional[FolderContext] = None) -> Tuple[List, List, Dict, Dict]:
     """
     Run the complete 3-stage council process.
 
@@ -324,11 +331,15 @@ async def run_full_council(user_query: str, roster=None) -> Tuple[List, List, Di
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
-    roster = roster or current_roster()
+    with use_context(context):
+        return await _run_full_council(user_query, roster or current_roster(), context)
+
+
+async def _run_full_council(user_query: str, roster, context: Optional[FolderContext]):
     members = roster.active_members()
 
     # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query, members)
+    stage1_results = await stage1_collect_responses(user_query, members, context)
 
     # If no models responded successfully, return error
     if not stage1_results:
@@ -338,7 +349,7 @@ async def run_full_council(user_query: str, roster=None) -> Tuple[List, List, Di
         }, {}
 
     # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, members)
+    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results, members, context)
 
     # Calculate aggregate rankings
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -349,6 +360,7 @@ async def run_full_council(user_query: str, roster=None) -> Tuple[List, List, Di
         stage1_results,
         stage2_results,
         roster.chair_member(),
+        context,
     )
 
     # Prepare metadata
@@ -356,5 +368,8 @@ async def run_full_council(user_query: str, roster=None) -> Tuple[List, List, Di
         "label_to_model": label_to_model,
         "aggregate_rankings": aggregate_rankings
     }
+    if context is not None:
+        metadata["context"] = {"root": str(context.root), "mode": context.mode,
+                               "files": [f.path for f in context.files]}
 
     return stage1_results, stage2_results, stage3_result, metadata

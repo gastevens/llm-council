@@ -3,11 +3,16 @@
     uv run python -m backend.tui            # real council (codex / claude / grok CLIs)
     uv run python -m backend.tui --fake     # canned answers, no CLI calls
     uv run python -m backend.tui --ask "Should we self-host email?"   # ask on open
+    uv run python -m backend.tui --context ~/Documents/Proposal   # discuss a folder
 
 Type a question at the bottom and press Enter. Stages render as they finish:
 Stage 1 one tab per member, Stage 2 peer rankings + collapsible critiques,
 Stage 3 the chairman's verdict. Follow-up questions in the same session carry
 the earlier questions and verdicts as context.
+
+Context folder: type `/context PATH` (add `--folder` or `--inline` to force a
+mode), `/context` to show it, `/context off` to drop it. The header shows the
+folder, file count and mode; a new session (ctrl+n) clears it.
 
 Keys: ctrl+e council settings (add/remove members, pick the chair)
       ctrl+n new session · ctrl+s save transcript (~/Documents/War Room/)
@@ -47,8 +52,9 @@ from textual.widgets import (  # noqa: E402
 
 from . import council  # noqa: E402
 from .config import TIMEOUT  # noqa: E402
+from .context import ContextError, FolderContext, build_context, describe, stage1_prompt  # noqa: E402
 from .council_config import Roster, RosterError, current_roster, load_roster  # noqa: E402
-from .providers import Member, kill_active_processes, query_member  # noqa: E402
+from .providers import Member, kill_active_processes, query_member, use_context  # noqa: E402
 from .slack_format import build_followup_question, deanonymize  # noqa: E402
 from .tui_council import CouncilScreen  # noqa: E402
 
@@ -107,9 +113,16 @@ class Events:
 
 
 async def run_council(prompt: str, events: Events, query: Query = query_member,
-                      roster: Optional[Roster] = None) -> Dict[str, Any]:
-    """Run the 3 stages on `prompt` (already folded with follow-up context)."""
-    roster = roster or current_roster()
+                      roster: Optional[Roster] = None,
+                      context: Optional[FolderContext] = None) -> Dict[str, Any]:
+    """Run the 3 stages on `prompt` (already folded with follow-up context),
+    optionally about a context folder (see backend.context)."""
+    with use_context(context):
+        return await _run_council(prompt, events, query, roster or current_roster(), context)
+
+
+async def _run_council(prompt: str, events: Events, query: Query, roster: Roster,
+                       context: Optional[FolderContext]) -> Dict[str, Any]:
     members = roster.active_members()
     chairman = roster.chair_member()
     result: Dict[str, Any] = {"answers": {}, "errors": {}, "stage1": [], "stage2": [],
@@ -133,7 +146,7 @@ async def run_council(prompt: str, events: Events, query: Query = query_member,
         return resp
 
     # Stage 1, member by member as each finishes
-    messages = [{"role": "user", "content": prompt}]
+    messages = [{"role": "user", "content": stage1_prompt(prompt, context)}]
 
     async def ask(m: Member):
         resp = await tracked(m, messages, TIMEOUT)
@@ -157,14 +170,15 @@ async def run_council(prompt: str, events: Events, query: Query = query_member,
     council.query_member = tracked
     try:
         phase["stage"] = 2
-        stage2, label_to_model = await council.stage2_collect_rankings(prompt, result["stage1"], members)
+        stage2, label_to_model = await council.stage2_collect_rankings(prompt, result["stage1"], members, context)
         reviewed = {r["model"] for r in stage2}
         result.update(stage2=stage2, label_to_model=label_to_model,
                       aggregate=council.calculate_aggregate_rankings(stage2, label_to_model),
                       failed_reviewers=[m.name for m in members if m.name not in reviewed])
         events.stage2_done(result)
         phase["stage"] = 3
-        result["stage3"] = await council.stage3_synthesize_final(prompt, result["stage1"], stage2, chairman)
+        result["stage3"] = await council.stage3_synthesize_final(prompt, result["stage1"], stage2, chairman,
+                                                                context)
     finally:
         council.query_member = original
     events.stage3_done(result)
@@ -207,6 +221,15 @@ def transcript_markdown(turns: List[Dict[str, Any]], started: datetime) -> str:
         out += [f"## Question {i}", "", t["question"], ""]
         names = t.get("members") or list((r.get("answers") or {}).keys())
         out += [f"_Council: {', '.join(names)} — chair: {t.get('chair', '?')}_", ""]
+        ctx = t.get("context")
+        if ctx:
+            mode = "inline" if ctx["mode"] == "inline" else "folder access"
+            out += [f"_Context folder: `{ctx['root']}` ({mode}, {len(ctx['files'])} files)_", ""]
+            out += [f"<details><summary>Context files</summary>", ""]
+            out += [f"- `{f}`" for f in ctx["files"][:500]]
+            if len(ctx["files"]) > 500:
+                out.append(f"- … and {len(ctx['files']) - 500} more")
+            out += ["", "</details>", ""]
         out += ["### Stage 1 · Individual answers", ""]
         for name in names:
             text = (r.get("answers") or {}).get(name)
@@ -421,13 +444,51 @@ def welcome_text(roster: Roster) -> str:
         f"[{DIM}]Ask a question below. {', '.join(m.name for m in roster.enabled)} answer independently, "
         f"review each other anonymously, and {roster.chairman} delivers the verdict.\n"
         "Follow-ups keep the earlier verdicts as context. ctrl+n starts fresh, ctrl+s saves a transcript, "
-        "ctrl+e edits the council.[/]"
+        "ctrl+e edits the council.\n"
+        "Type /context ~/some/folder to have the council discuss the files in a folder (/context off to drop it).[/]"
     )
 
 
-def roster_bar_text(roster: Roster) -> str:
+def roster_bar_text(roster: Roster, context: Optional[FolderContext] = None) -> str:
     dots = "  ".join(f"[{m.color}]●[/] {_escape(m.name)}" for m in roster.enabled)
-    return f"[{DIM}]COUNCIL[/]  {dots}    [{PURPLE}]◆[/] [{DIM}]chair[/] [bold]{_escape(roster.chairman)}[/]"
+    bar = f"[{DIM}]COUNCIL[/]  {dots}    [{PURPLE}]◆[/] [{DIM}]chair[/] [bold]{_escape(roster.chairman)}[/]"
+    if context is not None:
+        bar += f"    [{ORANGE}]▣[/] [{DIM}]context[/] {_escape(context.summary())}"
+    return bar
+
+
+CONTEXT_OFF = frozenset({"off", "clear", "none", "remove", "drop"})
+
+
+def parse_context_command(text: str) -> Optional[Dict[str, Any]]:
+    """Parse `/context …` typed in the input. None if the text isn't a /context command.
+
+    /context                 -> {"action": "show"}
+    /context off             -> {"action": "off"}
+    /context PATH [--folder|--inline|--auto]  -> {"action": "set", "path": PATH, "mode": …}
+    """
+    raw = text.strip()
+    if not (raw == "/context" or raw.startswith("/context ")):
+        return None
+    rest = raw[len("/context"):].strip()
+    if not rest:
+        return {"action": "show"}
+    if rest.lower() in CONTEXT_OFF:
+        return {"action": "off"}
+    mode = None
+    flags = {"--folder": "folder", "--inline": "inline", "--auto": "auto"}
+    for w in rest.split():
+        if w.lower() in flags:
+            mode = flags[w.lower()]
+    path = rest
+    if mode is not None:  # rebuild the path without the flag(s), keeping inner spaces
+        for flag in flags:
+            path = re.sub(rf"(^|\s){re.escape(flag)}(?=\s|$)", " ", path, flags=re.I)
+        path = path.strip()
+    path = path.strip().strip('"').strip("'").replace("\\ ", " ")
+    if not path:
+        return {"action": "error", "message": "Usage: /context PATH [--folder|--inline]"}
+    return {"action": "set", "path": path, "mode": mode}
 
 
 WAR_ROOM_THEME = Theme(
@@ -480,9 +541,14 @@ class WarRoomApp(App):
     ]
 
     def __init__(self, fake: bool = False, fake_delay: float = 0.8, fake_fail: Sequence[str] = (),
-                 save: bool = True, ask: Optional[str] = None) -> None:
+                 save: bool = True, ask: Optional[str] = None, context: Optional[str] = None,
+                 context_mode: Optional[str] = None, launch_cwd: Optional[str] = None) -> None:
         super().__init__()
         self.initial_question = ask
+        self.initial_context = context
+        self.initial_context_mode = context_mode
+        self.launch_cwd = launch_cwd or os.getcwd()
+        self.context: Optional[FolderContext] = None
         self.fake = fake
         self.query_fn: Query = make_fake_query(fake_delay, fake_fail) if fake else query_member
         self.persist = save and not fake
@@ -509,7 +575,7 @@ class WarRoomApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static(roster_bar_text(self.roster), id="roster-bar")
+        yield Static(roster_bar_text(self.roster, self.context), id="roster-bar")
         with VerticalScroll(id="log"):
             yield Static(welcome_text(self.roster), id="welcome")
         yield Input(placeholder="Ask the council…  (Enter to send)", id="ask")
@@ -522,8 +588,14 @@ class WarRoomApp(App):
         if self.roster_warning:
             self.notify(self.roster_warning, severity="warning", timeout=10)
         self.chat_screen.query_one("#ask", Input).focus()
+        if self.initial_question or self.initial_context:
+            self.call_after_refresh(self._startup)
+
+    async def _startup(self) -> None:
+        if self.initial_context:
+            await self.set_context(self.initial_context, self.initial_context_mode)
         if self.initial_question:
-            self.call_after_refresh(self._ask_initial)
+            await self._ask_initial()
 
     async def _ask_initial(self) -> None:
         inp = self.chat_screen.query_one("#ask", Input)
@@ -535,6 +607,11 @@ class WarRoomApp(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         question = event.value.strip()
         if not question or event.input.id != "ask":
+            return
+        cmd = parse_context_command(question)
+        if cmd is not None:
+            event.input.value = ""
+            await self.context_command(cmd)
             return
         if self.running:
             self.notify("The council is still in session; wait for the verdict.", severity="warning")
@@ -552,7 +629,11 @@ class WarRoomApp(App):
         self.running = True
         event.input.placeholder = "Council in session…"
         record = {"question": question, "prompt": prompt, "result": None, "error": None,
-                  "roster": roster, "members": [m.name for m in roster.enabled], "chair": roster.chairman}
+                  "roster": roster, "members": [m.name for m in roster.enabled], "chair": roster.chairman,
+                  "context_obj": self.context,
+                  "context": None if self.context is None else {
+                      "root": str(self.context.root), "mode": self.context.mode,
+                      "files": [f.path for f in self.context.files]}}
         self.turns.append(record)
         self.run_turn(turn, record)
 
@@ -561,7 +642,7 @@ class WarRoomApp(App):
         events = _ThreadEvents(self, turn)
         try:
             record["result"] = asyncio.run(run_council(record["prompt"], events, self.query_fn,
-                                                      record["roster"]))
+                                                      record["roster"], record.get("context_obj")))
         except Exception as e:  # never leave the UI stuck "in session"
             record["error"] = f"The council hit an error: {type(e).__name__}: {str(e)[:300]}"
             events.failed(record["error"])
@@ -607,10 +688,54 @@ class WarRoomApp(App):
         await log.remove_children()
         await log.mount(Static(welcome_text(self.roster), id="welcome"))
         self._new_state()
+        had_context = self.context is not None
+        self.context = None
+        self._refresh_roster_ui()
         inp = self.chat_screen.query_one("#ask", Input)
         inp.placeholder = "Ask the council…  (Enter to send)"
         inp.focus()
-        self.notify("New session started.")
+        self.notify("New session started." + (" Context folder cleared." if had_context else ""))
+
+    # -- context folder ---------------------------------------------------------
+
+    async def context_command(self, cmd: Dict[str, Any]) -> None:
+        action = cmd["action"]
+        if action == "show":
+            if self.context is None:
+                self.notify("No context folder. Type /context PATH to add one.")
+            else:
+                self.notify(describe(self.context), timeout=10)
+            return
+        if action == "error":
+            self.notify(cmd["message"], severity="warning")
+            return
+        if self.running:
+            self.notify("The council is still in session; change the context after the verdict.",
+                        severity="warning")
+            return
+        if action == "off":
+            had = self.context is not None
+            self.context = None
+            self._refresh_roster_ui()
+            self.notify("Context folder removed." if had else "No context folder was set.")
+            return
+        await self.set_context(cmd["path"], cmd.get("mode"))
+
+    async def set_context(self, path: str, mode: Optional[str] = None) -> bool:
+        self.notify(f"Reading {path}…", timeout=3)
+        try:
+            ctx = await asyncio.to_thread(build_context, path, None, mode, self.launch_cwd)
+        except ContextError as e:
+            self.notify(f"Context not set: {e}", severity="error", timeout=10)
+            return False
+        except Exception as e:  # never crash the UI on a weird folder
+            self.notify(f"Context not set: {type(e).__name__}: {e}", severity="error", timeout=10)
+            return False
+        self.context = ctx
+        self._refresh_roster_ui()
+        later = " Applies from the next question." if self.running else ""
+        self.notify(describe(ctx) + later, timeout=10)
+        return True
 
     def action_save_transcript(self) -> Optional[Path]:
         done = [t for t in self.turns if t.get("result") or t.get("error")]
@@ -654,8 +779,10 @@ class WarRoomApp(App):
         self.notify(f"Council saved: {roster.summary()}. Applies to the next question.{later}")
 
     def _refresh_roster_ui(self) -> None:
-        self.sub_title = self.roster.summary() + ("  [FAKE MODE]" if self.fake else "")
-        self.chat_screen.query_one("#roster-bar", Static).update(roster_bar_text(self.roster))
+        ctx = getattr(self, "context", None)
+        self.sub_title = (self.roster.summary() + (f"  ·  ▣ {ctx.summary()}" if ctx else "")
+                          + ("  [FAKE MODE]" if self.fake else ""))
+        self.chat_screen.query_one("#roster-bar", Static).update(roster_bar_text(self.roster, ctx))
         for w in self.chat_screen.query("#welcome"):
             w.update(welcome_text(self.roster))
 
@@ -694,13 +821,18 @@ def main() -> None:
                         help="with --fake: make this member fail stage 1 (repeatable)")
     parser.add_argument("--ask", metavar="QUESTION", help="ask this question as soon as the UI opens")
     parser.add_argument("--no-save", action="store_true", help="don't store the session in data/conversations")
+    parser.add_argument("--context", metavar="PATH", help="folder (or file) for the council to discuss")
+    parser.add_argument("--context-mode", choices=("auto", "inline", "folder"), default=None,
+                        help="inline (paste files), folder (read-only file tools) or auto (default)")
     args = parser.parse_args()
 
+    launch_cwd = os.environ.get("WARROOM_LAUNCH_CWD") or os.getcwd()
     os.chdir(REPO_ROOT)  # storage uses a repo-relative data directory
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, _on_hangup)
     app = WarRoomApp(fake=args.fake, fake_delay=args.fake_delay, fake_fail=args.fake_fail,
-                     save=not args.no_save, ask=args.ask)
+                     save=not args.no_save, ask=args.ask, context=args.context,
+                     context_mode=args.context_mode, launch_cwd=launch_cwd)
     code = 0
     try:
         app.run()

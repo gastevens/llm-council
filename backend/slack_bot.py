@@ -10,6 +10,9 @@ Triggers:
     remove, enable, disable, chair, title, models, test, reset)
   * any plain reply inside a War Room thread = follow-up question (earlier
     questions and verdicts from the thread are included as context)
+  * /warroom context PATH | off — a folder on this Mac the council reads for
+    questions in that channel; files attached to a question become that
+    thread's context (see backend.slack_context)
 
 Tokens come from the environment or the repo's .env file and are never printed:
   SLACK_BOT_TOKEN  (xoxb-...)  bot token from "OAuth & Permissions"
@@ -19,7 +22,9 @@ Optional:
   WARROOM_MAX_CONCURRENT  councils allowed to run at once (default 1; others queue)
   WARROOM_CRITIQUE_CHARS  max chars of each Stage 2 critique to post (default 1200, 0 = full)
   WARROOM_ADMINS          comma-separated Slack user IDs allowed to edit the roster
-                          (unset = anyone in the workspace)
+                          and set context folders (unset = anyone in the workspace)
+  WARROOM_CONTEXT_ROOTS   folders `/warroom context` may point into (default: $HOME)
+  WARROOM_MAX_FILE_MB     largest attachment downloaded as context (default 25)
 """
 
 import argparse
@@ -39,13 +44,14 @@ load_dotenv(REPO_ROOT / ".env")  # before config import so launchd runs see .env
 
 from .config import TIMEOUT  # noqa: E402
 from .council_config import Roster, config_path, current_roster, ping_member  # noqa: E402
-from . import slack_roster  # noqa: E402
+from . import slack_context, slack_roster  # noqa: E402
+from .context import FolderContext, stage1_prompt  # noqa: E402
 from .council import (  # noqa: E402
     calculate_aggregate_rankings,
     stage2_collect_rankings,
     stage3_synthesize_final,
 )
-from .providers import Member, query_member  # noqa: E402
+from .providers import Member, query_member, use_context  # noqa: E402
 from .slack_format import (  # noqa: E402
     VERDICT_PREFIX,
     build_followup_question,
@@ -61,6 +67,8 @@ log = logging.getLogger("warroom")
 MAX_CONCURRENT = max(1, int(os.getenv("WARROOM_MAX_CONCURRENT", "1")))
 CRITIQUE_CHARS = int(os.getenv("WARROOM_CRITIQUE_CHARS", "1200"))
 CONVENING_PREFIX = ":classical_building: Convening the council"
+DEFAULT_FILES_QUESTION = ("Review the attached files: summarize what they contain and flag anything "
+                          "important, risky or inconsistent.")
 SLASH_ROOT_MARK = "asked the war room:"
 
 Post = Callable[[str], None]
@@ -72,12 +80,19 @@ Post = Callable[[str], None]
 
 async def deliberate(question: str, post: Post, critique_chars: int = CRITIQUE_CHARS,
                      query: Callable[..., Awaitable] = query_member,
-                     roster: Optional[Roster] = None) -> Dict:
+                     roster: Optional[Roster] = None,
+                     context: Optional[FolderContext] = None) -> Dict:
     """Run the 3-stage council, calling post(text) for every Slack message.
 
     Stage 1 answers are posted one per member as soon as each finishes.
     Returns the stage 3 result dict.
     """
+    with use_context(context):
+        return await _deliberate(question, post, critique_chars, query, roster, context)
+
+
+async def _deliberate(question: str, post: Post, critique_chars: int, query: Callable[..., Awaitable],
+                      roster: Optional[Roster], context: Optional[FolderContext]) -> Dict:
     async def say(texts: List[str]) -> None:
         for t in texts:
             await asyncio.to_thread(post, t)
@@ -85,7 +100,7 @@ async def deliberate(question: str, post: Post, critique_chars: int = CRITIQUE_C
     roster = roster or current_roster()
     members = roster.active_members()
     chairman = roster.chair_member()
-    messages = [{"role": "user", "content": question}]
+    messages = [{"role": "user", "content": stage1_prompt(question, context)}]
 
     async def ask(m: Member):
         return m, await query(m, messages, timeout=TIMEOUT)
@@ -103,26 +118,48 @@ async def deliberate(question: str, post: Post, critique_chars: int = CRITIQUE_C
         await say([":x: Every council member failed to answer. Check that the CLIs are signed in on the Mac mini, then try again."])
         return {"model": "error", "response": "All models failed to respond."}
 
-    stage2, label_to_model = await stage2_collect_rankings(question, stage1, members)
+    stage2, label_to_model = await stage2_collect_rankings(question, stage1, members, context)
     aggregate = calculate_aggregate_rankings(stage2, label_to_model)
     reviewed = {r["model"] for r in stage2}
     failed = [m.name for m in members if m.name not in reviewed]
     await say(format_rankings(stage2, label_to_model, aggregate, critique_chars, failed))
 
-    stage3 = await stage3_synthesize_final(question, stage1, stage2, chairman)
+    stage3 = await stage3_synthesize_final(question, stage1, stage2, chairman, context)
     await say(format_verdict(stage3))
     return stage3
 
 
-def run_council_thread(question: str, post: Post, slots: threading.BoundedSemaphore) -> None:
-    """Blocking wrapper used from a worker thread."""
+def run_council_thread(question: str, post: Post, slots: threading.BoundedSemaphore,
+                       prepare: Optional[Callable[[], None]] = None,
+                       resolve: Optional[Callable[[], tuple]] = None) -> None:
+    """Blocking wrapper used from a worker thread.
+
+    `prepare` runs first (e.g. downloading attachments); `resolve` returns
+    (FolderContext | None, problem | None) for this channel/thread.
+    """
+    if prepare is not None:
+        try:
+            prepare()
+        except Exception as e:
+            log.exception("preparing the council failed")
+            post(f":warning: Couldn't fetch the attached files: `{type(e).__name__}: {str(e)[:200]}`")
     if not slots.acquire(blocking=False):
         post(":hourglass_flowing_sand: Another council is in session; yours is queued and will start when it finishes.")
         slots.acquire()
     try:
         roster = current_roster()  # read per question, so roster edits apply to the next one
         post(convening_text([m.name for m in roster.enabled], roster.chairman))
-        asyncio.run(deliberate(question, post, roster=roster))
+        ctx = None
+        if resolve is not None:
+            try:
+                ctx, problem = resolve()
+            except Exception as e:
+                ctx, problem = None, f"{type(e).__name__}: {str(e)[:200]}"
+            if problem:
+                post(f":warning: {problem} Answering without it.")
+            if ctx is not None:
+                post(slack_context.context_note(ctx))
+        asyncio.run(deliberate(question, post, roster=roster, context=ctx))
     except Exception as e:  # never leave the thread hanging silently
         log.exception("council run failed")
         post(f":x: The council hit an error: `{type(e).__name__}: {str(e)[:300]}`")
@@ -198,12 +235,32 @@ def build_app(**app_kwargs):
 
     app = App(token=os.environ["SLACK_BOT_TOKEN"], **app_kwargs)
     slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+    store = slack_context.ContextStore()
+    slack_context.prune_old_threads()
 
-    def start(client, channel: str, thread_ts: str, question: str) -> None:
+    def start(client, channel: str, thread_ts: str, question: str,
+              files: Optional[List[Dict]] = None) -> None:
         def post(text: str) -> None:
             client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text,
                                     unfurl_links=False, unfurl_media=False)
-        threading.Thread(target=run_council_thread, args=(question, post, slots), daemon=True).start()
+
+        def prepare() -> None:
+            if not files:
+                return
+            saved, problems = slack_context.download_files(
+                files, slack_context.thread_dir(channel, thread_ts), os.environ["SLACK_BOT_TOKEN"],
+                info=lambda fid: (client.files_info(file=fid).get("file") or {}))
+            if saved:
+                post(f":paperclip: Saved {len(saved)} attachment{'s' if len(saved) != 1 else ''} as "
+                     f"context for this thread: " + ", ".join(f"`{n}`" for n in saved))
+            for p in problems:
+                post(f":warning: Skipped {p}")
+
+        def resolve():
+            return slack_context.resolve_context(channel, thread_ts, store)
+
+        threading.Thread(target=run_council_thread, args=(question, post, slots, prepare, resolve),
+                         daemon=True).start()
 
     def with_context(client, event, bot_user_id: str, question: str) -> str:
         thread_ts = event.get("thread_ts")
@@ -221,17 +278,21 @@ def build_app(**app_kwargs):
         bot_user_id = context.get("bot_user_id")
         question = strip_mentions(event.get("text", ""))
         thread_ts = event.get("thread_ts") or event["ts"]
+        files = event.get("files") or []
+        if not question and files:
+            question = DEFAULT_FILES_QUESTION
         if not question:
             client.chat_postMessage(channel=event["channel"], thread_ts=thread_ts,
                                     text="Ask me something, e.g. `@War Room Should we self-host email?`")
             return
-        start(client, event["channel"], thread_ts, with_context(client, event, bot_user_id, question))
+        start(client, event["channel"], thread_ts, with_context(client, event, bot_user_id, question), files)
 
     @app.event("message")
     def on_message(event, client, context):
         # Plain replies inside a War Room thread are follow-ups.
         bot_user_id = context.get("bot_user_id")
-        if event.get("subtype") or event.get("bot_id") or event.get("user") == bot_user_id:
+        if event.get("subtype") not in (None, "file_share") or event.get("bot_id") \
+                or event.get("user") == bot_user_id:
             return
         thread_ts = event.get("thread_ts")
         if not thread_ts or thread_ts == event.get("ts"):
@@ -240,6 +301,9 @@ def build_app(**app_kwargs):
         if bot_user_id and f"<@{bot_user_id}" in text:
             return  # handled by app_mention
         question = strip_mentions(text)
+        files = event.get("files") or []
+        if not question and files:
+            question = DEFAULT_FILES_QUESTION
         if not question:
             return
         try:
@@ -249,12 +313,18 @@ def build_app(**app_kwargs):
             return
         if history is None:
             return  # not a War Room thread
-        start(client, event["channel"], thread_ts, build_followup_question(history, question))
+        start(client, event["channel"], thread_ts, build_followup_question(history, question), files)
 
     @app.command("/warroom")
     def on_command(ack, command, client, respond):
         ack()
         parsed = slack_roster.parse_slash_text(command.get("text") or "")
+        if parsed.kind == "context":
+            text = slack_context.handle_context_command(
+                parsed.args[0] if parsed.args else "", user_id=command.get("user_id", ""),
+                channel_id=command.get("channel_id", ""), store=store)
+            respond(text=text, response_type="ephemeral")
+            return
         if parsed.kind != "question":
             reply = slack_roster.dispatch_slash(parsed, user_id=command.get("user_id", ""))
             send_reply(reply, command.get("user_id", ""), respond, replace=False)

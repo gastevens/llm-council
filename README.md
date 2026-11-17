@@ -71,13 +71,23 @@ so there is no public URL or server to host) and uses the same subscription CLIs
   Edits write `~/.config/war-room/council.json` and apply to the next council in
   both Slack and the TUI. Set `WARROOM_ADMINS` to a comma-separated list of Slack
   user IDs to limit who can edit (unset = anyone in the workspace).
+- Context: `/warroom context ~/Documents/Proposal` makes the council read that folder
+  (on the Mac running the bot) for every question in the channel; `/warroom context`
+  shows it, `/warroom context off` removes it, `--folder` / `--inline` force a mode.
+  Files attached to an @mention or a thread reply are downloaded and become that
+  thread's context (they win over the channel folder; an @mention with only files asks
+  for a review). See [Context folders](#context-folders).
 
 ### 1. Create the Slack app (one time)
 
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**.
 2. Pick your workspace, choose YAML, paste [`slack/manifest.yaml`](slack/manifest.yaml), then **Create**.
    If the app already exists, open it → **App Manifest**, paste the updated YAML, and **Save**.
-   (Roster buttons need Interactivity enabled; Socket Mode still needs no Request URL. No new scopes, so you don't have to reinstall.)
+   (Roster buttons need Interactivity enabled; Socket Mode still needs no Request URL.)
+   The manifest now includes the `files:read` scope (attachments as context). Adding a scope
+   means Slack asks you to **reinstall**: after saving the manifest, open **Install App** →
+   **Reinstall to Workspace** → **Allow**. The bot token normally stays the same; if Slack shows
+   a new one, update `SLACK_BOT_TOKEN` in `.env`.
 3. **Install App** (left sidebar) → **Install to Workspace** → **Allow**.
    Copy the **Bot User OAuth Token** (`xoxb-…`).
 4. **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**.
@@ -149,12 +159,68 @@ Model ids: codex takes `-m` (the list comes from `~/.codex/models_cache.json`),
 claude takes `--model` aliases `opus`/`sonnet`/`haiku` or a full `claude-…`
 name, grok takes `-m` (`grok models` lists them), openrouter needs a model id.
 
+### Context folders
+
+Give the council a folder (or a single file) and the members answer about its contents,
+citing file paths; reviewers and the chair get the files too.
+
+- TUI: `uv run python -m backend.tui --context ~/Documents/Proposal`, or type
+  `/context PATH` in the input (`/context` shows it, `/context off` drops it,
+  add `--folder` / `--inline` to force a mode). The bar under the title shows
+  folder · files · size · mode. A new session (`ctrl+n`) clears it. Saved
+  transcripts record the folder and file list for each question.
+- Mac app: drop a folder on the War Room icon, or `open -a "War Room" ~/Documents/Proposal`
+  (or `open -a "War Room" --args --context /abs/path`).
+- CLI: `uv run python -m backend.ask --context ~/Documents/Proposal "What are the weak points?"`
+  (`--context-mode inline|folder|auto`).
+- Slack: `/warroom context PATH` per channel, or attach files (above).
+
+What gets read: text files of any kind (code, Markdown, JSON, CSV, YAML, logs…),
+PDFs (via `pdftotext` from poppler, or `pypdf` if installed) and `.docx`. Skipped:
+hidden files/folders, `.gitignore`d files when the folder is in a git repo,
+`node_modules`/build/venv folders, lockfiles, binaries and images; the skipped list
+is shown to the members.
+
+Two modes (`auto` picks):
+
+1. **inline** (default): the extracted text is pasted into the prompt with a
+   `===== FILE: path =====` header per file, so every member sees the same material.
+   Budget `COUNCIL_CONTEXT_MAX_CHARS` (default 400,000 characters, roughly 100k tokens),
+   at most `COUNCIL_CONTEXT_MAX_FILES` (400) files, each file capped at
+   `COUNCIL_CONTEXT_MAX_FILE_CHARS` (150,000). Stage 2 reviewers and the chair get the
+   full text when it's under `COUNCIL_CONTEXT_REVIEW_CHARS` (150,000), otherwise just
+   the file list.
+2. **folder access** (automatic when over budget, or forced): each member runs with
+   the folder as its working directory and read-only file tools, and opens what it needs.
+   Codex: `--sandbox read-only --cd FOLDER`, web search off (it reads with shell
+   commands; the sandbox blocks writes and network). Claude: `--tools Read,Glob,Grep`,
+   `--permission-mode dontAsk`, Bash/Edit/Write/Web disallowed. Grok: `--tools
+   read_file,list_dir,grep --sandbox read-only --permission-mode dontAsk
+   --disable-web-search`. OpenRouter members have no file tools, so they get the inline
+   text cut to the budget. Calls get `COUNCIL_TIMEOUT` × `COUNCIL_CONTEXT_TIMEOUT_FACTOR`
+   (default 2). Reviewers and the chair also run in the folder and may open files to
+   check citations.
+
+`COUNCIL_CONTEXT_MODE=auto|inline|folder` sets the default. Note: Codex's and Grok's
+read-only sandboxes block writes but can still *read* outside the folder; Claude is
+limited to the folder. Only point folder mode at material you're happy for the
+models to see, and keep `WARROOM_ADMINS` set when the Slack bot is in shared channels.
+
+Slack safety: `/warroom context PATH` is limited to `WARROOM_ADMINS` (when set),
+the path must be inside `WARROOM_CONTEXT_ROOTS` (comma-separated, default your home
+folder) and can't go through hidden folders (`~/.ssh`, `~/.config`…). Attachments
+are saved under `~/Library/Caches/war-room/slack-files/` (pruned after 14 days),
+max `WARROOM_MAX_FILE_MB` (25) each.
+
 `macos/build-app.sh` (re)builds `~/Applications/War Room.app`. It opens the TUI
 in its own Ghostty window (War Room icon in the Dock) and quits completely when
 that window closes: the TUI kills any running codex/claude/grok calls on hangup,
 and the window's wrapper script sweeps anything left. Re-run the build script
 after moving the repo. Extra arguments pass through:
-`open -a "War Room" --args --fake`.
+`open -a "War Room" --args --fake`. The app's executable is a small Swift
+program (`macos/WarRoomLauncher.swift`, compiled by the build script with the
+Xcode command-line tools) so folders dropped on the icon become the context
+folder; without `swiftc` it falls back to the plain launcher script.
 
 ## Vibe Code Alert
 

@@ -46,6 +46,7 @@ HELP_TEXT = """*War Room commands*
 `/warroom models [provider]` — known model ids
 `/warroom test NAME` — ping a member with a tiny prompt
 `/warroom reset` — back to environment defaults
+`/warroom context PATH` — have the council read a folder on the bot's Mac (this channel); `/warroom context` shows it, `/warroom context off` removes it. Or attach files to your question.
 `/warroom help`
 
 Providers: `codex`, `claude`, `grok`, `openrouter`. Two members on the same CLI need different names. Changes apply to the next council (Slack and the TUI share the same roster file)."""
@@ -101,6 +102,13 @@ def parse_slash_text(text: str) -> SlashParse:
     if not parts:
         return SlashParse("usage")
     cmd, args = parts[0].lower(), parts[1:]
+    if cmd == "context":
+        rest = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
+        low = rest.lower()
+        if (not rest or low in ("off", "clear", "none", "remove", "show")
+                or low in ("--folder", "--inline", "--auto") or _looks_like_path(rest)):
+            return SlashParse("context", [rest] if rest else [])
+        return SlashParse("question", question=raw)
     if cmd in ZERO_ARG and not args:
         return SlashParse(cmd)
     if cmd == "reset" and (not args or args == ["confirm"]):
@@ -116,6 +124,13 @@ def parse_slash_text(text: str) -> SlashParse:
     if cmd in NAME_COMMANDS and len(args) <= 1:
         return SlashParse(cmd, args)
     return SlashParse("question", question=raw)
+
+
+def _looks_like_path(rest: str) -> bool:
+    t = rest.strip().strip('"').strip("'")
+    for flag in ("--folder", "--inline", "--auto"):
+        t = t.replace(flag, "").strip()
+    return bool(t) and (t[0] in "~/.$" or "/" in t)
 
 
 def help_text() -> str:
@@ -320,6 +335,8 @@ def dispatch_slash(parsed: SlashParse, *, user_id: str, check_cli: bool = True,
     Question kinds are not handled here — the bot starts a council instead.
     """
     kind, args = parsed.kind, parsed.args
+    if kind == "context":  # needs the channel; the bot routes it to slack_context
+        return _text_reply("`/warroom context` needs a channel.", ok=False)
     if kind in ("usage", "help"):
         text = HELP_TEXT if kind == "help" else f"{USAGE_TEXT}\n\n{HELP_TEXT}"
         return _text_reply(text)

@@ -16,7 +16,7 @@ features:
   slash_commands:
     - command: /warroom
       description: Ask the council a question, or manage the roster
-      usage_hint: "<question> | roster | help | add | remove | chair"
+      usage_hint: "<question> | roster | context PATH | help | add | remove | chair"
       should_escape: false
 oauth_config:
   scopes:
@@ -26,6 +26,7 @@ oauth_config:
       - commands            # /warroom
       - channels:history    # read thread replies (follow-ups) in public channels
       - groups:history      # same, in private channels
+      - files:read          # download files attached to a question (thread context)
 settings:
   event_subscriptions:
     bot_events:
