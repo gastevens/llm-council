@@ -195,5 +195,9 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Loopback only by default: the API has no authentication, so binding wider
+    # exposes saved conversations and paid model calls to anyone on the network.
+    # Set LLM_COUNCIL_HOST only if you put authentication in front of it.
+    uvicorn.run(app, host=os.environ.get("LLM_COUNCIL_HOST", "127.0.0.1"), port=8001)
